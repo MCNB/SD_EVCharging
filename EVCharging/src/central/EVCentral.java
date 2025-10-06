@@ -879,6 +879,9 @@ public class EVCentral {
         }
     }
 
+
+    //Test para GIT
+
     private void handleCmd(com.sun.net.httpserver.HttpExchange ex) { // GET /cmd?op=PAUSE&cp=CP-001   |  RESUME  |  STOP
         try {
             var q = ex.getRequestURI().getQuery(); // op=...&cp=...

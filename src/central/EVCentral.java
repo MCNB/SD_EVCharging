@@ -162,7 +162,18 @@ public class EVCentral {
                 if (type == null) continue;
 
                 switch (type) {
-
+                    // -------- Engine: vínculo canal órdenes --------
+                    case "ENGINE_BIND" -> {
+                        String cpBind = msg.get("cp").getAsString();
+                        if (!cps.containsKey(cpBind)) {
+                            // si quieres, exige REG_CP previo
+                            // send(out, obj("type","ACK","ts",..., "msg","ERR CP_NO_REGISTRADO"));
+                            // break;
+                        }
+                        engineOut.put(cpBind, out);
+                        // opcional: ACK
+                        send(out, obj("type","ACK","ts",System.currentTimeMillis(),"msg","ENGINE_BIND "+cpBind));
+                    }
                     // -------- Monitor: alta CP --------
                     case "REG_CP" -> {
                         String cpID = msg.get("cp").getAsString();
@@ -178,7 +189,7 @@ public class EVCentral {
                             info.lastHb = System.currentTimeMillis();
                         }
                         // opcional: ACK
-                        // send(out, obj("type","ACK","ts",System.currentTimeMillis(),"msg","REG_CP "+cpID));
+                        send(out, obj("type","ACK","ts",System.currentTimeMillis(),"msg","REG_CP "+cpID));
                     }
 
                     // -------- Monitor: heartbeat --------
@@ -193,19 +204,8 @@ public class EVCentral {
                             if (!ok) info.estado = "AVERIADO";
                             else if (!info.parado) info.estado = "ACTIVADO";
                         }
-                        // send(out, obj("type","ACK","ts",System.currentTimeMillis(),"msg","HB "+cpID+" "+(ok?"OK":"KO")));
-                    }
-
-                    // -------- Engine: vínculo canal órdenes --------
-                    case "ENGINE_BIND" -> {
-                        String cpBind = msg.get("cp").getAsString();
-                        if (!cps.containsKey(cpBind)) {
-                            // si quieres, exige REG_CP previo
-                            // send(out, obj("type","ACK","ts",..., "msg","ERR CP_NO_REGISTRADO"));
-                            // break;
-                        }
-                        engineOut.put(cpBind, out);
-                        // send(out, obj("type","ACK","ts",System.currentTimeMillis(),"msg","ENGINE_BIND "+cpID));
+                        // opcional: ACK
+                        send(out, obj("type","ACK","ts",System.currentTimeMillis(),"msg","HB "+cpID+" "+(ok?"OK":"KO")));
                     }
 
                     // -------- Driver: solicitud de inicio --------
@@ -699,26 +699,24 @@ public class EVCentral {
     }
     
     private String pauseCp(String cpID){
-        CPInfo info = cps.get(cpID);
-        if (info==null) return "ERR CP_DESCONOCIDO";
-        synchronized(info){ 
-            info.parado = true; 
+    CPInfo info = cps.get(cpID);
+    if (info==null) return "ERR CP_DESCONOCIDO";
+    synchronized(info){ info.parado = true; }
+
+    String sID = cpSesionesActivas.get(cpID);
+    var eng = engineOut.get(cpID);
+    if (sID!=null && eng!=null) {
+        stopSolicitado.add(sID);
+        try {
+            send(eng, obj("type","CMD","ts",System.currentTimeMillis(),"cmd","STOP_SUPPLY","cp",cpID));
+            return "ACK PAUSE " + cpID + " (STOP_SUPPLY enviado)";
+        } catch (Exception e) {
+            engineOut.remove(cpID, eng);
+            return "ACK PAUSE " + cpID + " (ENGINE_IO_ERROR)";
         }
-        // si hay sesión, ordena corte
-        String sID = cpSesionesActivas.get(cpID);
-        var eng = engineOut.get(cpID);
-        if (sID!=null && eng!=null) {
-            stopSolicitado.add(sID);
-            try { 
-                eng.writeUTF("STOP_SUPPLY " + cpID); 
-                eng.flush(); 
-            } 
-            catch (Exception e){ 
-                engineOut.remove(cpID, eng); 
-            }
-        }
-        return "ACK PAUSE " + cpID;
     }
+    return "ACK PAUSE " + cpID;
+}
 
     private String resumeCp(String cpID){
         CPInfo info = cps.get(cpID);
@@ -731,20 +729,18 @@ public class EVCentral {
     }
 
     private String stopCp(String cpID){
-    String sId = cpSesionesActivas.get(cpID);
-    var eng = engineOut.get(cpID);
-    if (sId==null) return "ACK STOP " + cpID + " NO_SESSION";
-    if (eng==null)  return "ACK STOP " + cpID + " NO_ENGINE";
-    stopSolicitado.add(sId);
-    try {
-        send(eng, obj("type","CMD","ts",System.currentTimeMillis(),"cmd","STOP_SUPPLY","cp",cpID));
-        return "ACK STOP " + cpID + " SENT";
-    } catch(Exception e){
-        engineOut.remove(cpID, eng);
-        return "ACK STOP " + cpID + " ENGINE_IO_ERROR";
+        String sId = cpSesionesActivas.get(cpID);
+        var eng = engineOut.get(cpID);
+        if (sId==null) return "ACK STOP " + cpID + " NO_SESSION";
+        if (eng==null)  return "ACK STOP " + cpID + " NO_ENGINE";
+        stopSolicitado.add(sId);
+        try {
+            send(eng, obj("type","CMD","ts",System.currentTimeMillis(),"cmd","STOP_SUPPLY","cp",cpID));
+            return "ACK STOP " + cpID + " SENT";
+        } catch(Exception e){
+            engineOut.remove(cpID, eng);
+            return "ACK STOP " + cpID + " ENGINE_IO_ERROR";
+        }
     }
-}
-
-
 }
 

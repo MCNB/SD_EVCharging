@@ -8,19 +8,22 @@ import java.net.Socket;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
-import java.util.Locale;
 import java.util.Properties;
+
+import com.google.gson.JsonObject;
+import static common.net.Wire.*;
 
 public class CPEngine {
 
-    static volatile boolean enchufado = false;
-    static volatile boolean enMarcha = false;
-    static volatile String sesionActiva = null;
-    static volatile String cpIDActual = null;
-    static volatile boolean healthy = true; //KO/OK
+    private static volatile boolean enchufado = false;   // PLUG/UNPLUG
+    private static volatile boolean enMarcha  = false;   // suministrando
+    private static volatile boolean healthy   = true;    // para el monitor (KO/OK)
 
-    static double potenciaKW;
-    static int duracionDemoSec;
+    private static volatile String  sesionActiva = null;
+    private static volatile String  cpIDActual   = null;
+
+    // Simulación (ajusta a tus nombres/valores)
+    private static volatile double potenciaKW = 7.20;
 
     private static int parseIntOr(String s, int def) {
         try {
@@ -38,117 +41,7 @@ public class CPEngine {
             return def;
         }
     }
-
-    public static void main(String[] args) throws Exception {
-        String rutaConfig = "config/engine.config";
-
-        Properties config = new Properties();
-        Path ruta = Path.of(rutaConfig).toAbsolutePath().normalize();
-
-        try (InputStream fichero = Files.newInputStream(ruta)) {
-            config.load(fichero);
-        } catch (NoSuchFileException e) {
-            System.err.println("[ENG] No encuentro el fichero de configuración: " + ruta);
-            System.exit(1);
-            return;
-        } catch (Exception e) {
-            System.err.println("[ENG] Error leyendo configuración en " + ruta + ": " + e.getMessage());
-            System.exit(1);
-            return;
-        }
-        String host = config.getProperty("engine.centralHost", "127.0.0.1");
-        int puerto = parseIntOr(config.getProperty("engine.centralPort","5000"),5000);
-        int puertoHealth = parseIntOr(config.getProperty("engine.healthPort","6100"),6100);
-        String cpID = config.getProperty("engine.cpId", "CP-001");
-        potenciaKW = parseDoubleOr(config.getProperty("engine.potenciaKW","7.2"),7.2);
-        duracionDemoSec = parseIntOr(config.getProperty("engine.durationSec", "15"),15);
-        double precio = parseDoubleOr(config.getProperty("engine.precio","0.35"),0.35);
-
-        iniciarHealthServer(puertoHealth);
-        iniciarConsola();
     
-
-        while (true) {
-            try (Socket s = new Socket(host, puerto);
-             var in = new DataInputStream(s.getInputStream());
-             var out = new DataOutputStream(s.getOutputStream())) {
-
-                out.writeUTF("ENGINE_BIND " + cpID);
-                //String ack = in.readUTF();
-
-                while (true){
-                    String msg = in.readUTF();
-                    if (msg == null || msg.isBlank()) {
-                        continue;
-                    }
-                    String[] p = msg.trim().split("\\s+");
-                    String comando = p[0].toUpperCase();
-                    
-
-                    switch (comando){
-                        case "START" -> {
-                            
-                            String sesionID = p[1], cp = p[2];
-                            double precioPorkWh = parseDoubleOr(p[3], precio);
-                            sesionActiva = sesionID;
-                            cpIDActual = cp;
-
-                            System.out.println("[ENG] START sesión " + sesionID + " en " + cp + " precio = " + precioPorkWh);
-                            System.out.println("[ENG] Esperando PLUG...");
-                            while (!enchufado && sesionID.equals(sesionActiva)) {
-                                Thread.sleep(100);
-                            }
-
-                            if (!sesionID.equals(sesionActiva)) {
-                                break;
-                            }
-
-                            enMarcha = true;
-                            double kWh = 0.0, eur =0.0;
-                            int seg = 0;
-                            long t0 = System.currentTimeMillis();
-                            while (enMarcha && enchufado && sesionID.equals(sesionActiva)) {
-                                long t = System.currentTimeMillis();
-                                if (t - t0 < 1000) {
-                                    Thread.sleep(10);
-                                    continue;
-                                }
-                                t0 = t;
-                                kWh += potenciaKW / 3600.0;
-                                eur = kWh * precioPorkWh;
-                                String telemetria = String.format(Locale.ROOT,"TEL %s %s %.2f %.5f %.4f",
-                                        sesionID, cp, potenciaKW, kWh, eur);
-                                out.writeUTF(telemetria);
-                                if (duracionDemoSec > 0 && ++seg >= duracionDemoSec) {
-                                    enMarcha = false;
-                                }
-                               
-                            }
-                            out.writeUTF("END " + sesionID + " " + cp);
-                            System.out.println("[ENG] -> END " + sesionID + " " + cp);
-                            enMarcha = false;
-                            sesionActiva = null;
-                            cpIDActual = null;
-                        }
-                        
-                        case "STOP_SUPPLY" -> {
-                            System.out.println("[ENG] STOP_SUPPLY recibido");
-                            enMarcha = false;
-                        }
-                        case "ACK" -> {//Ignora ACK
-                        }
-
-                        default -> System.out.println("[ENG] Comando desconocido: " + msg);
-                    }
-                }
-            }
-            catch (Exception e) {
-                System.out.println("[ENG] Reconectando en 1s: " + e.getMessage());
-                Thread.sleep(1000);
-            }
-        }      
-    }
-
     public static void iniciarHealthServer (int port) {
         Thread t = new Thread(() -> {
             try (var ss = new ServerSocket(port)) {
@@ -220,4 +113,114 @@ public class CPEngine {
         consola.setDaemon(true);
         consola.start();
     }
+
+    private static void conectarYAtenderCentral(String host, int port, String cpID) {
+    while (true) {
+        try (var s   = new java.net.Socket(host, port);
+             var in  = new java.io.DataInputStream(s.getInputStream());
+             var out = new java.io.DataOutputStream(s.getOutputStream())) {
+
+            System.out.println("[ENG] Conectado a CENTRAL " + host + ":" + port);
+
+            // 1) Vincular este canal al CP (ENGINE_BIND)
+            send(out, obj("type","ENGINE_BIND","ts",System.currentTimeMillis(),"cp",cpID));
+
+            // 2) Escuchar órdenes
+            while (true) {
+                JsonObject m = recv(in);
+                String type = m.get("type").getAsString();
+
+                if ("START".equals(type)) {
+                    String session = m.get("session").getAsString();
+                    String cp      = m.get("cp").getAsString();
+                    double price   = m.get("price").getAsDouble();
+
+                    // Espera/arranque
+                    sesionActiva = session; cpIDActual = cp; enMarcha = true;
+                    System.out.println("[ENG] START sesión " + session + " en " + cp + " (precio " + price + ")");
+
+                    // Bucle de telemetrías (1s)
+                    double kwh = 0.0, eur = 0.0;
+                    long last = System.currentTimeMillis();
+
+                    while (enMarcha && enchufado && session.equals(sesionActiva)) {
+                        long now = System.currentTimeMillis();
+                        if (now - last < 1000) { Thread.sleep(10); continue; }
+                        last = now;
+
+                        // Simulación sencilla
+                        kwh += potenciaKW / 3600.0;
+                        eur  = kwh * price;
+
+                        send(out, obj(
+                            "type","TEL","ts",now,
+                            "session",session,"cp",cp,
+                            "pkw",potenciaKW,"kwh",kwh,"eur",eur
+                        ));
+                    }
+
+                    // Fin de sesión
+                    String reason = enMarcha ? "STOP" : "OK"; // si te cortó CENTRAL → STOP; si se desenchufa → OK
+                    send(out, obj(
+                        "type","END","ts",System.currentTimeMillis(),
+                        "session",session,"cp",cp,"reason",reason
+                    ));
+                    System.out.println("[ENG] END sesión " + session + " (" + reason + ")");
+
+                    // Reset flags
+                    enMarcha = false; sesionActiva = null; cpIDActual = null;
+                }
+                else if ("CMD".equals(type)) {
+                    String cmd = m.get("cmd").getAsString();
+                    String cp  = m.has("cp") ? m.get("cp").getAsString() : null;
+                    if ("STOP_SUPPLY".equals(cmd)) {
+                        System.out.println("[ENG] CMD STOP_SUPPLY" + (cp!=null?(" "+cp):""));
+                        enMarcha = false; // saldrá del bucle de TEL y enviará END con reason=STOP
+                    } else {
+                        System.out.println("[ENG] CMD desconocido: " + cmd);
+                    }
+                }
+                else {
+                    System.out.println("[ENG] Mensaje desconocido: " + type);
+                }
+            }
+
+        } catch (Exception e) {
+            System.out.println("[ENG] Desconectado de CENTRAL: " + e.getMessage() + " (reintento 1s)");
+            try { Thread.sleep(1000); } catch (InterruptedException ignore) {}
+        }
+    }
+}
+
+    public static void main(String[] args) throws Exception {
+        String rutaConfig = "config/engine.config";
+
+        Properties config = new Properties();
+        Path ruta = Path.of(rutaConfig).toAbsolutePath().normalize();
+
+        try (InputStream fichero = Files.newInputStream(ruta)) {
+            config.load(fichero);
+        } catch (NoSuchFileException e) {
+            System.err.println("[ENG] No encuentro el fichero de configuración: " + ruta);
+            System.exit(1);
+            return;
+        } catch (Exception e) {
+            System.err.println("[ENG] Error leyendo configuración en " + ruta + ": " + e.getMessage());
+            System.exit(1);
+            return;
+        }
+        String host = config.getProperty("engine.centralHost", "127.0.0.1");
+        int puerto = parseIntOr(config.getProperty("engine.centralPort","5000"),5000);
+        int puertoHealth = parseIntOr(config.getProperty("engine.healthPort","6100"),6100);
+        String cpID = config.getProperty("engine.cpId", "CP-001");
+        potenciaKW = parseDoubleOr(config.getProperty("engine.potenciaKW","7.2"),7.2);
+
+
+        iniciarHealthServer(puertoHealth);
+        iniciarConsola();
+        conectarYAtenderCentral(host, puerto, cpID);
+        
+    }
+
+ 
 }

@@ -88,8 +88,11 @@ public class EVDriver {
         while (true) {
             System.out.print("CP-ID> ");
             String cp = br.readLine();
-            if (cp == null || cp.isBlank()) break;
-            cp = cp.trim().replace(' ', '-');
+            if (cp == null) break;
+            cp = cp.trim();
+            if (cp.isEmpty()) break;
+            String low = cp.toLowerCase(Locale.ROOT);
+            if (low.equals("q") || low.equals("quit") || low.equals("exit")) break;
 
             // REQ_START
             send(out, obj("type","REQ_START","ts",System.currentTimeMillis(),"driver",driverId,"cp",cp));
@@ -134,55 +137,64 @@ public class EVDriver {
                                             List<String> cpList,
                                             DataInputStream in,
                                             DataOutputStream out) throws Exception {
+       
         for (int i = 0; i < cpList.size(); i++) {
             String cp = cpList.get(i);
+            boolean realizado = false;
+            int reintentos = 0;
 
-            // REQ_START
-            send(out, obj("type","REQ_START","ts",System.currentTimeMillis(),"driver",driverId,"cp",cp));
-            System.out.printf("[DRV] (%d/%d) -> REQ_START %s %s%n", i+1, cpList.size(), driverId, cp);
+            while (!realizado) {
+                try {
+                    // REQ_START
+                    send(out, obj("type","REQ_START","ts",System.currentTimeMillis(),"driver",driverId,"cp",cp));
+                    System.out.printf("[DRV] (%d/%d) -> REQ_START %s %s%n", i+1, cpList.size(), driverId, cp);
 
-            // AUTH
-            JsonObject ans = recv(in);
-            if (!"AUTH".equals(ans.get("type").getAsString())) {
-                System.out.println("[DRV] Respuesta inesperada: " + ans);
-                // opcional: esperar 4s igualmente
-                if (i < cpList.size() - 1) Thread.sleep(4000);
-                continue;
-            }
-            boolean ok = ans.get("ok").getAsBoolean();
-            if (!ok) {
-                String reason = ans.has("reason") ? ans.get("reason").getAsString() : "?";
-                System.out.println("[DRV] ❌ DENEGADO: " + reason);
-                if (i < cpList.size() - 1) {
-                    System.out.println("[DRV] Esperando 4 segundos antes del siguiente servicio...");
-                    Thread.sleep(4000);
+                    // AUTH
+                    JsonObject ans = recv(in);
+                    if (!"AUTH".equals(ans.get("type").getAsString())) {
+                        System.out.println("[DRV] Respuesta inesperada: " + ans);
+                        break; // pasa al siguiente CP
+                    }
+                    if (!ans.get("ok").getAsBoolean()) {
+                        String reason = ans.has("reason") ? ans.get("reason").getAsString() : "?";
+                        System.out.println("[DRV] DENEGADO: " + reason);
+                        break; // pasa al siguiente CP
+                    }
+
+                    String ses = ans.get("session").getAsString();
+                    String cpR = ans.get("cp").getAsString();
+                    double pr  = ans.get("price").getAsDouble();
+                    System.out.println("[DRV] AUTORIZADO: sesión " + ses + " en " + cpR + " (precio " + pr + ")");
+
+                    // Esperar TICKET
+                    while (true) {
+                        JsonObject ev = recv(in);
+                        if ("TICKET".equals(ev.get("type").getAsString())) {
+                            String sid = ev.get("session").getAsString();
+                            String cpx = ev.get("cp").getAsString();
+                            double kwh = ev.get("kwh").getAsDouble();
+                            double eur = ev.get("eur").getAsDouble();
+                            String rsn = ev.get("reason").getAsString();
+                            System.out.printf("[DRV] TICKET %s %s kWh=%.5f €=%.4f reason=%s%n", sid, cpx, kwh, eur, rsn);
+                            realizado = true;
+                            break;
+                        } else {
+                            System.out.println("[DRV] (evento) " + ev);
+                        }
+                    }
+
+                } catch (Exception ex) {
+                    reintentos++;
+                    System.out.println("[DRV] Conexión caída durante el servicio ("+cp+"): " + ex.getMessage());
+                    if (reintentos > 3) {
+                        System.out.println("[DRV] Saltando "+cp+" tras 3 reintentos.");
+                        break; // pasa al siguiente CP
+                    }
+                    System.out.println("[DRV] Reintentando "+cp+" en 1s...");
+                    try { Thread.sleep(1000); } catch (InterruptedException ignore) {}
                 }
-                continue;
             }
 
-            String ses = ans.get("session").getAsString();
-            String cpR = ans.get("cp").getAsString();
-            double pr  = ans.get("price").getAsDouble();
-            System.out.println("[DRV] ✅ AUTORIZADO: sesión " + ses + " en " + cpR + " (precio " + pr + ")");
-
-            // Esperar TICKET
-            while (true) {
-                JsonObject ev = recv(in);
-                String t = ev.get("type").getAsString();
-                if ("TICKET".equals(t)) {
-                    String sid = ev.get("session").getAsString();
-                    String cpx = ev.get("cp").getAsString();
-                    double kwh = ev.get("kwh").getAsDouble();
-                    double eur = ev.get("eur").getAsDouble();
-                    String rsn = ev.get("reason").getAsString();
-                    System.out.printf("[DRV] 🎫 TICKET %s %s kWh=%.5f €=%.4f reason=%s%n", sid, cpx, kwh, eur, rsn);
-                    break;
-                } else {
-                    System.out.println("[DRV] (evento) " + ev);
-                }
-            }
-
-            // Pausa 4s salvo que fuese el último
             if (i < cpList.size() - 1) {
                 System.out.println("[DRV] Esperando 4 segundos antes del siguiente servicio...");
                 Thread.sleep(4000);

@@ -22,6 +22,8 @@ public class CPEngine {
     private static volatile String  sesionActiva = null;
     private static volatile String  cpIDActual   = null;
 
+    private static volatile boolean stopByCmd = false;
+
     // Simulación (ajusta a tus nombres/valores)
     private static volatile double potenciaKW = 7.20;
 
@@ -33,14 +35,12 @@ public class CPEngine {
             return def;
         }
     }
-    private static Double parseDoubleOr(String s, double def) {
-        try {
-            return Double.parseDouble(s);
-        }
-        catch (Exception e) {
-            return def;
-        }
+    
+   private static double parseDoubleOr(String s, double def) {
+        try { return Double.parseDouble(s); }
+        catch (Exception e) { return def; }
     }
+
     
     public static void iniciarHealthServer (int port) {
         Thread t = new Thread(() -> {
@@ -76,7 +76,7 @@ public class CPEngine {
         
         Thread consola = new Thread(() -> {
             try (var br = new java.io.BufferedReader(new java.io.InputStreamReader(System.in))){
-                System.out.println("[ENG] Comandos: PLUG | UNPLUG | STATUS");
+                System.out.println("[ENG] Comandos: PLUG | UNPLUG | STATUS | OK | KO");
                 for (String line; (line = br.readLine()) !=null; ){
                     switch (line.trim().toUpperCase()) {
                         case "PLUG" -> {
@@ -89,7 +89,12 @@ public class CPEngine {
                             System.out.println("[ENG] UNPLUG");
                         }
                         case "STATUS" -> {
-                            System.out.println("[ENG] Enchufado = " + enchufado + " En marcha = " + enMarcha + "Sesión = " + sesionActiva);
+                            System.out.println("[ENG] enchufado=" + enchufado +
+                                " enMarcha=" + enMarcha +
+                                " sesion=" + sesionActiva +
+                                " cp=" + cpIDActual +
+                                " healthy=" + healthy +
+                                " pKW=" + potenciaKW);
                         }
                         case "OK" -> {
                             healthy = true;
@@ -135,9 +140,16 @@ public class CPEngine {
                     String cp      = m.get("cp").getAsString();
                     double price   = m.get("price").getAsDouble();
 
-                    // Espera/arranque
+                    
                     sesionActiva = session; cpIDActual = cp; enMarcha = true;
                     System.out.println("[ENG] START sesión " + session + " en " + cp + " (precio " + price + ")");
+                    
+                    // Esperar enchufe (o STOP) hasta 10s antes de empezar a telemetrear
+                    long t0Plug = System.currentTimeMillis();
+                    while (enMarcha && !enchufado && session.equals(sesionActiva)) {
+                        if (System.currentTimeMillis() - t0Plug > 10_000) break; // timeout opcional
+                        Thread.sleep(50);
+                    }
 
                     // Bucle de telemetrías (1s)
                     double kwh = 0.0, eur = 0.0;
@@ -160,7 +172,11 @@ public class CPEngine {
                     }
 
                     // Fin de sesión
-                    String reason = enMarcha ? "STOP" : "OK"; // si te cortó CENTRAL → STOP; si se desenchufa → OK
+                    String reason;
+                    if (stopByCmd)      reason = "STOP";
+                    else if (!healthy)  reason = "KO";   // opcional: reflejar avería local
+                    else                reason = "OK";
+
                     send(out, obj(
                         "type","END","ts",System.currentTimeMillis(),
                         "session",session,"cp",cp,"reason",reason
@@ -168,20 +184,20 @@ public class CPEngine {
                     System.out.println("[ENG] END sesión " + session + " (" + reason + ")");
 
                     // Reset flags
+                    stopByCmd = false;
                     enMarcha = false; sesionActiva = null; cpIDActual = null;
+
                 }
                 else if ("CMD".equals(type)) {
                     String cmd = m.get("cmd").getAsString();
                     String cp  = m.has("cp") ? m.get("cp").getAsString() : null;
                     if ("STOP_SUPPLY".equals(cmd)) {
                         System.out.println("[ENG] CMD STOP_SUPPLY" + (cp!=null?(" "+cp):""));
-                        enMarcha = false; // saldrá del bucle de TEL y enviará END con reason=STOP
+                        stopByCmd = true;
+                        enMarcha = false; // el bucle de TEL saldrá
                     } else {
                         System.out.println("[ENG] CMD desconocido: " + cmd);
                     }
-                }
-                else {
-                    System.out.println("[ENG] Mensaje desconocido: " + type);
                 }
             }
 

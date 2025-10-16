@@ -198,7 +198,7 @@ public class EVCentral {
 
                         CPInfo info = cps.computeIfAbsent(cpID, _ -> new CPInfo());
                         synchronized (info) {
-                            info.cpID = cpID;    // <-- unifica a cpID
+                            info.cpID = cpID;
                             info.ubicacion = loc;
                             info.precio = price;
                             info.estado = "ACTIVADO";
@@ -206,7 +206,7 @@ public class EVCentral {
                         }
                         // opcional: ACK
                         send(out, obj("type","ACK","ts",System.currentTimeMillis(),"msg","REG_CP "+cpID));
-                        bus.publish(T_STATUS, obj("type","REG_CP","ts",System.currentTimeMillis(),"cp",cpID,"loc",loc,"price",price));
+                        bus.publish(T_STATUS, cpID, obj("type","REG_CP","ts",System.currentTimeMillis(),"cp",cpID,"loc",loc,"price",price));
 
                     }
 
@@ -224,7 +224,7 @@ public class EVCentral {
                         }
                         // opcional: ACK
                         send(out, obj("type","ACK","ts",System.currentTimeMillis(),"msg","HB "+cpID+" "+(ok?"OK":"KO")));
-                        bus.publish(T_STATUS, obj("type","HB","ts",System.currentTimeMillis(),"cp",cpID,"ok",ok));
+                        bus.publish(T_STATUS, cpID, obj("type","HB","ts",System.currentTimeMillis(),"cp",cpID,"ok",ok));
 
                     }
 
@@ -251,7 +251,7 @@ public class EVCentral {
                             // Crear sesión
                             String sesId = "S-" + System.currentTimeMillis();
                             info.ocupado = true;
-                            SesionInfo sInf = new SesionInfo(sesId, cpID, driverId); // ajusta nombre de clase si usas SessionInfo
+                            SesionInfo sInf = new SesionInfo(sesId, cpID, driverId); 
                             sesiones.put(sesId, sInf);
                             cpSesionesActivas.put(cpID, sesId);
 
@@ -265,7 +265,8 @@ public class EVCentral {
                                     System.out.println("[CENTRAL] Error enviando START a Engine " + cpID + " (IO)");
                                     break;
                                 }
-                                bus.publish(T_SESSIONS, obj("type","SESSION_START","ts",System.currentTimeMillis(),"session",sesId,"cp",cpID,"driver",driverId,"price",info.precio));
+                                bus.publish(T_SESSIONS, sesId, obj("type","SESSION_START","ts",System.currentTimeMillis(),"session",sesId,"cp",cpID,"driver",driverId,"price",info.precio));
+
 
                                 // DB: apertura (si hay BD)
                                 try { dbOpenSession(sesId, cpID, driverId, info.precio); } catch (Exception ignore) {}
@@ -288,16 +289,12 @@ public class EVCentral {
                     // -------- Engine: telemetrías --------
                     case "TEL" -> {
                         String sesID = msg.get("session").getAsString();
-                        // String cpID = msg.get("cp").getAsString(); // si quieres validarlo
                         double kwh = msg.get("kwh").getAsDouble();
                         double eur = msg.get("eur").getAsDouble();
                         var sInf = sesiones.get(sesID);
                         if (sInf != null) { sInf.kWhAccumulado = kwh; sInf.eurAccumulado = eur; }
                         String cpFromMsg = msg.has("cp") ? msg.get("cp").getAsString() : (sInf!=null ? sInf.cpID : "");
-                        bus.publish(T_TELEMETRY, obj("type","TEL","ts",System.currentTimeMillis(), "session", sesID, "cp", cpFromMsg, "kwh", kwh, "eur", eur));
-
-
-                        // Batch a BD si quieres
+                        bus.publish(T_TELEMETRY, sesID, obj("type","TEL","ts",System.currentTimeMillis(),"session",sesID,"cp",cpFromMsg,"kwh",kwh,"eur",eur));
                     }
 
                     // -------- Engine: fin de sesión --------
@@ -317,7 +314,8 @@ public class EVCentral {
 
                         try { dbCloseSession(sesId, reason, kwh, eur); } catch (Exception ignore) {}
 
-                        bus.publish(T_SESSIONS, obj("type","SESSION_END","ts",System.currentTimeMillis(),"session",sesId,"cp",cpID,"kwh",kwh,"eur",eur,"reason",reason));
+                        bus.publish(T_SESSIONS, sesId, obj("type","SESSION_END","ts",System.currentTimeMillis(),"session",sesId,"cp",cpID,"kwh",kwh,"eur",eur,"reason",reason));
+
 
                         var drv = sesionToDriver.remove(sesId); // <- unificado
                         if (drv != null) {
@@ -362,7 +360,7 @@ public class EVCentral {
                     System.out.println("----------+-----------------+--------+---------+------------+--------+------------+---------+---------");
 
                     long now = System.currentTimeMillis();
-                    for (Map.Entry<String, CPInfo> e : cps.entrySet()) { // <- tipo explícito: cero problemas
+                    for (Map.Entry<String, CPInfo> e : cps.entrySet()) {
                         String cpID = e.getKey();
                         CPInfo info = e.getValue();
 
@@ -738,6 +736,7 @@ public class EVCentral {
         if (sID!=null) {
             stopSolicitado.add(sID);
             boolean ok = sendToEngine(cpID, obj("type","CMD","ts",System.currentTimeMillis(),"cmd","STOP_SUPPLY","cp",cpID));
+            bus.publish(T_CMD, cpID, obj("type","CMD","ts",System.currentTimeMillis(),"cmd","PAUSE","cp",cpID));
             return ok ? "ACK PAUSE " + cpID + " (STOP_SUPPLY enviado)" : "ACK PAUSE " + cpID + " (ENGINE_IO_ERROR)";
         }
         return "ACK PAUSE " + cpID;
@@ -750,6 +749,7 @@ public class EVCentral {
             info.parado = false; 
             if (!"AVERIADO".equals(info.estado)) info.estado="ACTIVADO"; 
         }
+        bus.publish(T_CMD, cpID, obj("type","CMD","ts",System.currentTimeMillis(),"cmd","PAUSE","cp",cpID));
         return "ACK RESUME " + cpID;
     }
 
@@ -758,8 +758,8 @@ public class EVCentral {
         if (sId==null) return "ACK STOP " + cpID + " NO_SESSION";
         stopSolicitado.add(sId);
         boolean ok = sendToEngine(cpID, obj("type","CMD","ts",System.currentTimeMillis(),"cmd","STOP_SUPPLY","cp",cpID));
+        bus.publish(T_CMD, cpID, obj("type","CMD","ts",System.currentTimeMillis(),"cmd","STOP_SUPPLY","cp",cpID));
         return ok ? "ACK STOP " + cpID + " SENT" : "ACK STOP " + cpID + " ENGINE_IO_ERROR";
-
     }
     
     private void onKafkaCmd(com.google.gson.JsonObject m) {
@@ -787,5 +787,5 @@ public class EVCentral {
         }
     }
 
-    }
+}
 

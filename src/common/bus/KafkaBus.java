@@ -66,6 +66,12 @@ public final class KafkaBus implements EventBus {
     t.start();
   }
 
+  @Override public void publish(String topic, String key, JsonObject msg) {
+    producer.send(new ProducerRecord<>(topic, key, msg.toString()), (md, ex) -> {
+      if (ex != null) System.err.println("[KAFKA] publish err: " + ex.getMessage());
+    });
+  }
+
   @Override public void close() {
     running = false;
     try { producer.flush(); producer.close(); } catch (Exception ignore){}

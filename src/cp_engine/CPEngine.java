@@ -120,93 +120,93 @@ public class CPEngine {
     }
 
     private static void conectarYAtenderCentral(String host, int port, String cpID) {
-    while (true) {
-        try (var s   = new java.net.Socket(host, port);
-             var in  = new java.io.DataInputStream(s.getInputStream());
-             var out = new java.io.DataOutputStream(s.getOutputStream())) {
+        while (true) {
+            try (var s   = new java.net.Socket(host, port);
+                var in  = new java.io.DataInputStream(s.getInputStream());
+                var out = new java.io.DataOutputStream(s.getOutputStream())) {
 
-            System.out.println("[ENG] Conectado a CENTRAL " + host + ":" + port);
+                System.out.println("[ENG] Conectado a CENTRAL " + host + ":" + port);
 
-            // 1) Vincular este canal al CP (ENGINE_BIND)
-            send(out, obj("type","ENGINE_BIND","ts",System.currentTimeMillis(),"cp",cpID));
+                // 1) Vincular este canal al CP (ENGINE_BIND)
+                send(out, obj("type","ENGINE_BIND","ts",System.currentTimeMillis(),"cp",cpID));
 
-            // 2) Escuchar órdenes
-            while (true) {
-                JsonObject m = recv(in);
-                String type = m.get("type").getAsString();
+                // 2) Escuchar órdenes
+                while (true) {
+                    JsonObject m = recv(in);
+                    String type = m.get("type").getAsString();
 
-                if ("START".equals(type)) {
-                    String session = m.get("session").getAsString();
-                    String cp      = m.get("cp").getAsString();
-                    double price   = m.get("price").getAsDouble();
+                    if ("START".equals(type)) {
+                        String session = m.get("session").getAsString();
+                        String cp      = m.get("cp").getAsString();
+                        double price   = m.get("price").getAsDouble();
 
-                    
-                    sesionActiva = session; cpIDActual = cp; enMarcha = true;
-                    System.out.println("[ENG] START sesión " + session + " en " + cp + " (precio " + price + ")");
-                    
-                    // Esperar enchufe (o STOP) hasta 10s antes de empezar a telemetrear
-                    long t0Plug = System.currentTimeMillis();
-                    while (enMarcha && !enchufado && session.equals(sesionActiva)) {
-                        if (System.currentTimeMillis() - t0Plug > 10_000) break; // timeout opcional
-                        Thread.sleep(50);
-                    }
+                        
+                        sesionActiva = session; cpIDActual = cp; enMarcha = true;
+                        System.out.println("[ENG] START sesión " + session + " en " + cp + " (precio " + price + ")");
+                        
+                        // Esperar enchufe (o STOP) hasta 10s antes de empezar a telemetrear
+                        long t0Plug = System.currentTimeMillis();
+                        while (enMarcha && !enchufado && session.equals(sesionActiva)) {
+                            if (System.currentTimeMillis() - t0Plug > 10_000) break; // timeout opcional
+                            Thread.sleep(50);
+                        }
 
-                    // Bucle de telemetrías (1s)
-                    double kwh = 0.0, eur = 0.0;
-                    long last = System.currentTimeMillis();
+                        // Bucle de telemetrías (1s)
+                        double kwh = 0.0, eur = 0.0;
+                        long last = System.currentTimeMillis();
 
-                    while (enMarcha && enchufado && session.equals(sesionActiva)) {
-                        long now = System.currentTimeMillis();
-                        if (now - last < 1000) { Thread.sleep(10); continue; }
-                        last = now;
+                        while (enMarcha && enchufado && session.equals(sesionActiva)) {
+                            long now = System.currentTimeMillis();
+                            if (now - last < 1000) { Thread.sleep(10); continue; }
+                            last = now;
 
-                        // Simulación sencilla
-                        kwh += potenciaKW / 3600.0;
-                        eur  = kwh * price;
+                            // Simulación sencilla
+                            kwh += potenciaKW / 3600.0;
+                            eur  = kwh * price;
+
+                            send(out, obj(
+                                "type","TEL","ts",now,
+                                "session",session,"cp",cp,
+                                "pkw",potenciaKW,"kwh",kwh,"eur",eur
+                            ));
+                        }
+
+                        // Fin de sesión
+                        String reason;
+                        if (stopByCmd)      reason = "STOP";
+                        else if (!healthy)  reason = "KO";   // opcional: reflejar avería local
+                        else                reason = "OK";
 
                         send(out, obj(
-                            "type","TEL","ts",now,
-                            "session",session,"cp",cp,
-                            "pkw",potenciaKW,"kwh",kwh,"eur",eur
+                            "type","END","ts",System.currentTimeMillis(),
+                            "session",session,"cp",cp,"reason",reason
                         ));
+                        System.out.println("[ENG] END sesión " + session + " (" + reason + ")");
+
+                        // Reset flags
+                        stopByCmd = false;
+                        enMarcha = false; sesionActiva = null; cpIDActual = null;
+
                     }
-
-                    // Fin de sesión
-                    String reason;
-                    if (stopByCmd)      reason = "STOP";
-                    else if (!healthy)  reason = "KO";   // opcional: reflejar avería local
-                    else                reason = "OK";
-
-                    send(out, obj(
-                        "type","END","ts",System.currentTimeMillis(),
-                        "session",session,"cp",cp,"reason",reason
-                    ));
-                    System.out.println("[ENG] END sesión " + session + " (" + reason + ")");
-
-                    // Reset flags
-                    stopByCmd = false;
-                    enMarcha = false; sesionActiva = null; cpIDActual = null;
-
-                }
-                else if ("CMD".equals(type)) {
-                    String cmd = m.get("cmd").getAsString();
-                    String cp  = m.has("cp") ? m.get("cp").getAsString() : null;
-                    if ("STOP_SUPPLY".equals(cmd)) {
-                        System.out.println("[ENG] CMD STOP_SUPPLY" + (cp!=null?(" "+cp):""));
-                        stopByCmd = true;
-                        enMarcha = false; // el bucle de TEL saldrá
-                    } else {
-                        System.out.println("[ENG] CMD desconocido: " + cmd);
+                    else if ("CMD".equals(type)) {
+                        String cmd = m.get("cmd").getAsString();
+                        String cp  = m.has("cp") ? m.get("cp").getAsString() : null;
+                        if ("STOP_SUPPLY".equals(cmd)) {
+                            System.out.println("[ENG] CMD STOP_SUPPLY" + (cp!=null?(" "+cp):""));
+                            stopByCmd = true;
+                            enMarcha = false; // el bucle de TEL saldrá
+                        } else {
+                            System.out.println("[ENG] CMD desconocido: " + cmd);
+                        }
                     }
                 }
+
+            } catch (Exception e) {
+                System.out.println("[ENG] Desconectado de CENTRAL: " + e.getMessage() + " (reintento 1s)");
+                try { Thread.sleep(1000); } catch (InterruptedException ignore) {}
             }
-
-        } catch (Exception e) {
-            System.out.println("[ENG] Desconectado de CENTRAL: " + e.getMessage() + " (reintento 1s)");
-            try { Thread.sleep(1000); } catch (InterruptedException ignore) {}
         }
     }
-}
 
     public static void main(String[] args) throws Exception {
         String rutaConfig = "config/engine.config";

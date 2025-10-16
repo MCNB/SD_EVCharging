@@ -19,6 +19,9 @@ import com.sun.net.httpserver.HttpServer;
 import com.sun.net.httpserver.HttpExchange;
 import java.nio.charset.StandardCharsets;
 
+import common.bus.EventBus;
+import common.bus.NoBus;
+import common.bus.KafkaBus;
 
 
 public class EVCentral {
@@ -52,6 +55,8 @@ public class EVCentral {
     private final Map<String, DataOutputStream> sesionToDriver = new ConcurrentHashMap<>();
     private final java.util.Set<String> stopSolicitado = java.util.concurrent.ConcurrentHashMap.newKeySet(); //Para ver si el END viene de un STOP manual
     private final static java.util.Set<String> driversValidos = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private EventBus bus = new NoBus();
+    private String T_TELEMETRY, T_SESSIONS, T_STATUS, T_CMD;
     
 
     //Para evitar trolleos en el fichero de configuración
@@ -75,7 +80,7 @@ public class EVCentral {
             st.setTimestamp(5, java.sql.Timestamp.from(java.time.Instant.now()),
                     java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC")));
             st.execute();
-        } catch (Exception e) { System.out.println("[CENTRAL][DB] spOpenSession " + e.getMessage()); }
+        } catch (Exception e) { System.out.println("[CENTRAL][DB] spOpenSession("+sID+","+cpID+") ERROR: " + e.getMessage()); }
     }
 
     private void dbCloseSession (String sID, String motivo, double kwh, double eur){
@@ -88,7 +93,7 @@ public class EVCentral {
             st.setBigDecimal(4, java.math.BigDecimal.valueOf(kwh).setScale(6, java.math.RoundingMode.HALF_UP));
             st.setBigDecimal(5, java.math.BigDecimal.valueOf(eur).setScale(4, java.math.RoundingMode.HALF_UP));
             st.execute();
-        } catch (Exception e) { System.out.println("[CENTRAL][DB] spCloseSession " + e.getMessage()); }
+        } catch (Exception e) { System.out.println("[CENTRAL][DB] spCloseSession("+sID+") ERROR: " + e.getMessage()); }
     }
 
     public static void main (String[] args) throws Exception {
@@ -121,12 +126,23 @@ public class EVCentral {
             dbLoadDrivers();
         }
 
-        
-
         boolean consolePanel = Boolean.parseBoolean(config.getProperty("central.consolepanel","false"));
         int httpPort = parseIntOr(config.getProperty("central.httpPort"),8080);
         
         var central = new EVCentral();
+
+        central.T_TELEMETRY = config.getProperty("kafka.topic.telemetry","ev.telemetry.v1");
+        central.T_SESSIONS  = config.getProperty("kafka.topic.sessions","ev.sessions.v1");
+        central.T_STATUS    = config.getProperty("kafka.topic.status","ev.status.v1");
+        central.T_CMD       = config.getProperty("kafka.topic.cmd","ev.cmd.v1");
+        central.bus = KafkaBus.from(config);
+
+        // Suscripción a comandos (PAUSE/RESUME/STOP) vía Kafka
+        central.bus.subscribe(central.T_CMD, central::onKafkaCmd);
+
+        // Cierre limpio al terminar la JVM
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> { try { central.bus.close(); } catch(Exception ignore){} }, "shutdown-central"));
+
         if (consolePanel) {
             central.iniciarPanel();   
         }
@@ -190,6 +206,8 @@ public class EVCentral {
                         }
                         // opcional: ACK
                         send(out, obj("type","ACK","ts",System.currentTimeMillis(),"msg","REG_CP "+cpID));
+                        bus.publish(T_STATUS, obj("type","REG_CP","ts",System.currentTimeMillis(),"cp",cpID,"loc",loc,"price",price));
+
                     }
 
                     // -------- Monitor: heartbeat --------
@@ -206,6 +224,8 @@ public class EVCentral {
                         }
                         // opcional: ACK
                         send(out, obj("type","ACK","ts",System.currentTimeMillis(),"msg","HB "+cpID+" "+(ok?"OK":"KO")));
+                        bus.publish(T_STATUS, obj("type","HB","ts",System.currentTimeMillis(),"cp",cpID,"ok",ok));
+
                     }
 
                     // -------- Driver: solicitud de inicio --------
@@ -237,14 +257,22 @@ public class EVCentral {
 
                             try {
                                 // START -> Engine
-                                send(eng, obj("type","START","ts",System.currentTimeMillis(),"session",sesId,"cp",cpID,"price",info.precio));
+                                if (!sendToEngine(cpID, obj("type","START","ts",System.currentTimeMillis(),"session",sesId,"cp",cpID,"price",info.precio))) {
+                                    info.ocupado = false;
+                                    sesiones.remove(sesId);
+                                    cpSesionesActivas.remove(cpID, sesId);
+                                    send(out, obj("type","AUTH","ts",System.currentTimeMillis(),"ok",false,"reason","ENGINE_IO_ERROR"));
+                                    System.out.println("[CENTRAL] Error enviando START a Engine " + cpID + " (IO)");
+                                    break;
+                                }
+                                bus.publish(T_SESSIONS, obj("type","SESSION_START","ts",System.currentTimeMillis(),"session",sesId,"cp",cpID,"driver",driverId,"price",info.precio));
+
                                 // DB: apertura (si hay BD)
                                 try { dbOpenSession(sesId, cpID, driverId, info.precio); } catch (Exception ignore) {}
                             } catch (Exception ex) {
                                 info.ocupado = false;
                                 sesiones.remove(sesId);
                                 cpSesionesActivas.remove(cpID, sesId);
-                                engineOut.remove(cpID, eng);
                                 send(out, obj("type","AUTH","ts",System.currentTimeMillis(),"ok",false,"reason","ENGINE_IO_ERROR"));
                                 System.out.println("[CENTRAL] Error enviando START a Engine " + cpID + ": " + ex.getMessage());
                                 break;
@@ -265,6 +293,10 @@ public class EVCentral {
                         double eur = msg.get("eur").getAsDouble();
                         var sInf = sesiones.get(sesID);
                         if (sInf != null) { sInf.kWhAccumulado = kwh; sInf.eurAccumulado = eur; }
+                        String cpFromMsg = msg.has("cp") ? msg.get("cp").getAsString() : (sInf!=null ? sInf.cpID : "");
+                        bus.publish(T_TELEMETRY, obj("type","TEL","ts",System.currentTimeMillis(), "session", sesID, "cp", cpFromMsg, "kwh", kwh, "eur", eur));
+
+
                         // Batch a BD si quieres
                     }
 
@@ -285,9 +317,12 @@ public class EVCentral {
 
                         try { dbCloseSession(sesId, reason, kwh, eur); } catch (Exception ignore) {}
 
+                        bus.publish(T_SESSIONS, obj("type","SESSION_END","ts",System.currentTimeMillis(),"session",sesId,"cp",cpID,"kwh",kwh,"eur",eur,"reason",reason));
+
                         var drv = sesionToDriver.remove(sesId); // <- unificado
                         if (drv != null) {
                             send(drv, obj("type","TICKET","ts",System.currentTimeMillis(),"session",sesId,"cp",cpID,"kwh",kwh,"eur",eur,"reason",reason));
+
                         }
                     }
 
@@ -398,43 +433,43 @@ public class EVCentral {
 }
 
     private void iniciarWatchdog () {
-    Thread w = new Thread(() -> {
-        while (true) {
-            long now = System.currentTimeMillis();
-            try {
-                for (Map.Entry<String, CPInfo> e : cps.entrySet()) {
-                    String cpID = e.getKey();
-                    CPInfo info = e.getValue();
-                    String sID = cpSesionesActivas.get(cpID);
+        Thread w = new Thread(() -> {
+            while (true) {
+                long now = System.currentTimeMillis();
+                try {
+                    for (Map.Entry<String, CPInfo> e : cps.entrySet()) {
+                        String cpID = e.getKey();
+                        CPInfo info = e.getValue();
+                        String sID = cpSesionesActivas.get(cpID);
 
-                    long lag = now - info.lastHb;
-                    if (lag > 3000) { // 3s sin latidos -> desconectado
-                        boolean cortar = false;
-                        synchronized (info) {
-                            if (!"DESCONECTADO".equals(info.estado)) {
-                                info.estado = "DESCONECTADO";
-                                cortar = info.ocupado; // si estaba suministrando, cortamos
+                        long lag = now - info.lastHb;
+                        if (lag > 3000) { // 3s sin latidos -> desconectado
+                            boolean cortar = false;
+                            synchronized (info) {
+                                if (!"DESCONECTADO".equals(info.estado)) {
+                                    info.estado = "DESCONECTADO";
+                                    cortar = info.ocupado; // si estaba suministrando, cortamos
+                                }
                             }
-                        }
-                        if (cortar) {
-                            var eng = engineOut.get(cpID);
-                            if (sID != null && eng != null) {
-                                stopSolicitado.add(sID);
-                                try { send(eng, obj("type","CMD","ts",System.currentTimeMillis(),"cmd","STOP_SUPPLY","cp",cpID)); }
-                                catch (Exception ex) { engineOut.remove(cpID, eng); }
-                            }
+                            if (cortar) {
+                                var eng = engineOut.get(cpID);
+                                if (sID != null && eng != null) {
+                                    stopSolicitado.add(sID);
+                                    sendToEngine(cpID, obj("type","CMD","ts",System.currentTimeMillis(),"cmd","STOP_SUPPLY","cp",cpID)); // si falla, el helper limpia el canal
 
+                                }
+
+                            }
                         }
                     }
-                }
-                Thread.sleep(1000);
-            } catch (InterruptedException ie) {
-                return;
-            } catch (Exception ignore) {}
-        }
-    }, "watchdog-central");
-    w.setDaemon(true);
-    w.start();
+                    Thread.sleep(1000);
+                } catch (InterruptedException ie) {
+                    return;
+                } catch (Exception ignore) {}
+            }
+        }, "watchdog-central");
+        w.setDaemon(true);
+        w.start();
 }
 
     private void iniciarHttpStatus (int httpPort) {
@@ -699,24 +734,14 @@ public class EVCentral {
     }
     
     private String pauseCp(String cpID){
-    CPInfo info = cps.get(cpID);
-    if (info==null) return "ERR CP_DESCONOCIDO";
-    synchronized(info){ info.parado = true; }
-
-    String sID = cpSesionesActivas.get(cpID);
-    var eng = engineOut.get(cpID);
-    if (sID!=null && eng!=null) {
-        stopSolicitado.add(sID);
-        try {
-            send(eng, obj("type","CMD","ts",System.currentTimeMillis(),"cmd","STOP_SUPPLY","cp",cpID));
-            return "ACK PAUSE " + cpID + " (STOP_SUPPLY enviado)";
-        } catch (Exception e) {
-            engineOut.remove(cpID, eng);
-            return "ACK PAUSE " + cpID + " (ENGINE_IO_ERROR)";
+        String sID = cpSesionesActivas.get(cpID);
+        if (sID!=null) {
+            stopSolicitado.add(sID);
+            boolean ok = sendToEngine(cpID, obj("type","CMD","ts",System.currentTimeMillis(),"cmd","STOP_SUPPLY","cp",cpID));
+            return ok ? "ACK PAUSE " + cpID + " (STOP_SUPPLY enviado)" : "ACK PAUSE " + cpID + " (ENGINE_IO_ERROR)";
         }
+        return "ACK PAUSE " + cpID;
     }
-    return "ACK PAUSE " + cpID;
-}
 
     private String resumeCp(String cpID){
         CPInfo info = cps.get(cpID);
@@ -730,17 +755,37 @@ public class EVCentral {
 
     private String stopCp(String cpID){
         String sId = cpSesionesActivas.get(cpID);
-        var eng = engineOut.get(cpID);
         if (sId==null) return "ACK STOP " + cpID + " NO_SESSION";
-        if (eng==null)  return "ACK STOP " + cpID + " NO_ENGINE";
         stopSolicitado.add(sId);
+        boolean ok = sendToEngine(cpID, obj("type","CMD","ts",System.currentTimeMillis(),"cmd","STOP_SUPPLY","cp",cpID));
+        return ok ? "ACK STOP " + cpID + " SENT" : "ACK STOP " + cpID + " ENGINE_IO_ERROR";
+
+    }
+    
+    private void onKafkaCmd(com.google.gson.JsonObject m) {
         try {
-            send(eng, obj("type","CMD","ts",System.currentTimeMillis(),"cmd","STOP_SUPPLY","cp",cpID));
-            return "ACK STOP " + cpID + " SENT";
-        } catch(Exception e){
-            engineOut.remove(cpID, eng);
-            return "ACK STOP " + cpID + " ENGINE_IO_ERROR";
+            if (!m.has("type") || !"CMD".equals(m.get("type").getAsString())) return;
+            String cmd = m.get("cmd").getAsString();
+            String cp  = m.get("cp").getAsString();
+            switch (cmd) {
+            case "STOP_SUPPLY" -> System.out.println("[CENTRAL][KAFKA] " + stopCp(cp));
+            case "PAUSE"       -> System.out.println("[CENTRAL][KAFKA] " + pauseCp(cp));
+            case "RESUME"      -> System.out.println("[CENTRAL][KAFKA] " + resumeCp(cp));
+            default            -> System.out.println("[CENTRAL][KAFKA] CMD desconocido: " + cmd);
+            }
+        } catch (Exception e) {
+            System.err.println("[CENTRAL][KAFKA] onCmd: " + e.getMessage());
+        }
+        }
+
+    private boolean sendToEngine(String cpID, JsonObject payload) {
+        var eng = engineOut.get(cpID);
+        if (eng == null) return false;
+        synchronized (eng) {
+            try { send(eng, payload); return true; }
+            catch (Exception e) { engineOut.remove(cpID, eng); return false; }
         }
     }
-}
+
+    }
 

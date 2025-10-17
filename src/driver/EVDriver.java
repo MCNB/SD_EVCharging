@@ -9,6 +9,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
 
+import common.bus.EventBus;
+import common.bus.NoBus;
+import common.bus.KafkaBus;
+
 public class EVDriver {
 
     // ---- Helpers de lectura de config (sin args) ----
@@ -31,7 +35,7 @@ public class EVDriver {
         }
         return out;
     }
-
+    private static EventBus bus = new NoBus();
     public static void main(String[] args) {
         try {
             // 1) Cargar configuración
@@ -95,6 +99,9 @@ public class EVDriver {
             if (low.equals("q") || low.equals("quit") || low.equals("exit")) break;
 
             // REQ_START
+            // EVDriver (modo Kafka)
+            bus.publish("ev.cmd.v1", cp, obj("type","CMD","cmd","REQ_START","ts",System.currentTimeMillis(),"driver",driverId,"cp",cp));
+
             send(out, obj("type","REQ_START","ts",System.currentTimeMillis(),"driver",driverId,"cp",cp));
             // AUTH
             JsonObject ans = recv(in);
@@ -105,13 +112,13 @@ public class EVDriver {
             boolean ok = ans.get("ok").getAsBoolean();
             if (!ok) {
                 String reason = ans.has("reason") ? ans.get("reason").getAsString() : "?";
-                System.out.println("[DRV] ❌ DENEGADO: " + reason);
+                System.out.println("[DRV] DENEGADO: " + reason);
                 continue;
             }
             String ses = ans.get("session").getAsString();
             String cpR = ans.get("cp").getAsString();
             double pr  = ans.get("price").getAsDouble();
-            System.out.println("[DRV] ✅ AUTORIZADO: sesión " + ses + " en " + cpR + " (precio " + pr + ")");
+            System.out.println("[DRV] AUTORIZADO: sesión " + ses + " en " + cpR + " (precio " + pr + ")");
 
             // Esperar TICKET
             while (true) {

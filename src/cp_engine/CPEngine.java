@@ -13,6 +13,10 @@ import java.util.Properties;
 import com.google.gson.JsonObject;
 import static common.net.Wire.*;
 
+import common.bus.EventBus;
+import common.bus.KafkaBus;
+import common.bus.NoBus;
+
 public class CPEngine {
 
     private static volatile boolean enchufado = false;   // PLUG/UNPLUG
@@ -26,6 +30,10 @@ public class CPEngine {
 
     // Simulación (ajusta a tus nombres/valores)
     private static volatile double potenciaKW = 7.20;
+
+    private static EventBus bus = new NoBus();
+    private static String T_CMD, T_TEL;
+
 
     private static int parseIntOr(String s, int def) {
         try {
@@ -164,11 +172,9 @@ public class CPEngine {
                             kwh += potenciaKW / 3600.0;
                             eur  = kwh * price;
 
-                            send(out, obj(
-                                "type","TEL","ts",now,
-                                "session",session,"cp",cp,
-                                "pkw",potenciaKW,"kwh",kwh,"eur",eur
-                            ));
+                            send(out, obj("type","TEL","ts",now,"session",session,"cp",cp,"pkw",potenciaKW,"kwh",kwh,"eur",eur));
+                            // NUEVO: espejo de telemetría por Kafka (clave = session)
+                            bus.publish(T_TEL, session, obj("type","TEL","ts",now,"session",session,"cp",cp,"kwh",kwh,"eur",eur));
                         }
 
                         // Fin de sesión
@@ -231,6 +237,27 @@ public class CPEngine {
         String cpID = config.getProperty("engine.cpId", "CP-001");
         potenciaKW = parseDoubleOr(config.getProperty("engine.potenciaKW","7.2"),7.2);
 
+        T_CMD = config.getProperty("kafka.topic.cmd","ev.cmd.v1");
+        T_TEL = config.getProperty("kafka.topic.telemetry","ev.telemetry.v1");
+        bus = KafkaBus.from(config); // si kafka.enable=false → NoBus interno
+
+        bus.subscribe(T_CMD, (com.google.gson.JsonObject m) -> {
+            try {
+                if (!m.has("type") || !"CMD".equals(m.get("type").getAsString())) return;
+                String cp = m.get("cp").getAsString();
+                if (!cpID.equals(cp)) return;
+                String cmd = m.get("cmd").getAsString();
+                switch (cmd) {
+                    case "STOP_SUPPLY" -> { System.out.println("[ENG][KAFKA] STOP"); enMarcha = false; }
+                    case "PAUSE"       -> { System.out.println("[ENG][KAFKA] PAUSE"); enMarcha = false; }
+                    case "RESUME"      -> { System.out.println("[ENG][KAFKA] RESUME? (no-ops aquí)"); }
+                }
+            } catch (Exception ex) { System.err.println("[ENG][KAFKA] " + ex.getMessage()); }
+        });
+         // Cierre limpio del bus al apagar la JVM
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try { bus.close(); } catch (Exception ignore) {}
+        }, "eng-shutdown"));
 
         iniciarHealthServer(puertoHealth);
         iniciarConsola();

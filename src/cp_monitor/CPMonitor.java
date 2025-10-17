@@ -61,10 +61,14 @@ public class CPMonitor {
                         // Health check puntual (abre/cierra para simplificar y evitar fugas)
                         boolean ok;
                         try (Socket sEngine = new Socket(engineHost, enginePort);
-                             DataInputStream  inEngine  = new DataInputStream(sEngine.getInputStream());
-                             DataOutputStream outEngine = new DataOutputStream(sEngine.getOutputStream())) {
-                            outEngine.writeUTF("PING");
-                            ok = "OK".equalsIgnoreCase(inEngine.readUTF());
+                            DataInputStream  inEngine  = new DataInputStream(sEngine.getInputStream());
+                            DataOutputStream outEngine = new DataOutputStream(sEngine.getOutputStream())) {
+                            // JSON health ping (compatible con el Engine nuevo)
+                            send(outEngine, obj("type","PING","ts",System.currentTimeMillis()));
+                            var resp = recv(inEngine);
+                            ok = (resp != null)
+                                 && resp.has("type") && "PONG".equalsIgnoreCase(resp.get("type").getAsString())
+                                 && (!resp.has("ok") || resp.get("ok").getAsBoolean());
                         } catch (Exception e) { ok = false; }
 
                         // Enviar HB

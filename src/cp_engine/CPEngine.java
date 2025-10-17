@@ -19,199 +19,27 @@ import common.bus.NoBus;
 
 public class CPEngine {
 
-    private static volatile boolean enchufado = false;   // PLUG/UNPLUG
-    private static volatile boolean enMarcha  = false;   // suministrando
-    private static volatile boolean healthy   = true;    // para el monitor (KO/OK)
+    // ---- Estado simulado (igual que antes)
+    static volatile boolean enchufado = false;
+    static volatile boolean enMarcha = false;
+    static volatile String sesionActiva = null;
+    static volatile String cpIDActual = null;
+    static volatile boolean healthy = true; // KO/OK
 
-    private static volatile String  sesionActiva = null;
-    private static volatile String  cpIDActual   = null;
+    static double potenciaKW;
+    static int duracionDemoSec;
 
-    private static volatile boolean stopByCmd = false;
-
-    // Simulación (ajusta a tus nombres/valores)
-    private static volatile double potenciaKW = 7.20;
-
+    // ---- Kafka
     private static EventBus bus = new NoBus();
-    private static String T_CMD, T_TEL;
-
+    private static String T_TELEMETRY, T_SESSIONS, T_CMD;
 
     private static int parseIntOr(String s, int def) {
-        try {
-            return Integer.parseInt(s);
-        }
-        catch (Exception e) {
-            return def;
-        }
-    }
-    
-   private static double parseDoubleOr(String s, double def) {
-        try { return Double.parseDouble(s); }
+        try { return Integer.parseInt(s); }
         catch (Exception e) { return def; }
     }
-
-    
-    public static void iniciarHealthServer (int port) {
-        Thread t = new Thread(() -> {
-            try (var ss = new ServerSocket(port)) {
-                System.out.println("[ENG][HEALTH] Escuchando en " + port);
-                while (true) {
-                    var c = ss.accept();
-                    new Thread(() -> {
-                        try (var in = new DataInputStream(c.getInputStream());
-                             var out = new DataOutputStream(c.getOutputStream())) {
-                            while (true){
-                                String msg = in.readUTF();
-                                if("PING".equalsIgnoreCase(msg)) {
-                                    out.writeUTF(healthy ? "OK" : "KO");
-                                }
-                                else{
-                                    out.writeUTF("UNKNOWN");
-                                }
-                            }
-                        }
-                        catch (Exception ignore){}
-                    }, "eng-health-client").start();
-                }
-            } catch (Exception e) {
-                System.err.println("[ENG][HEALTH] ERROR: " + e.getMessage());
-            }
-        }, "eng-health");
-        t.setDaemon(true);
-        t.start();
-    }
-
-    private static void iniciarConsola() {
-        
-        Thread consola = new Thread(() -> {
-            try (var br = new java.io.BufferedReader(new java.io.InputStreamReader(System.in))){
-                System.out.println("[ENG] Comandos: PLUG | UNPLUG | STATUS | OK | KO");
-                for (String line; (line = br.readLine()) !=null; ){
-                    switch (line.trim().toUpperCase()) {
-                        case "PLUG" -> {
-                            enchufado = true;
-                            System.out.println("[ENG] PLUG");
-                        }
-                        case "UNPLUG" -> {
-                            enchufado = false;
-                            enMarcha = false;
-                            System.out.println("[ENG] UNPLUG");
-                        }
-                        case "STATUS" -> {
-                            System.out.println("[ENG] enchufado=" + enchufado +
-                                " enMarcha=" + enMarcha +
-                                " sesion=" + sesionActiva +
-                                " cp=" + cpIDActual +
-                                " healthy=" + healthy +
-                                " pKW=" + potenciaKW);
-                        }
-                        case "OK" -> {
-                            healthy = true;
-                            System.out.println("[ENG] Salud = OK");
-                        }
-                        case "KO" -> {
-                            healthy = false;
-                            System.out.println("[ENG] Salud = KO");
-                        }
-                    
-                        default -> {
-                            if (!line.isBlank()) {
-                                System.out.println("[ENG] Comando desconocido");
-                            }
-                        }
-                    }
-                }
-            }
-            catch (Exception ignore){}
-        }, "engine-console");
-        consola.setDaemon(true);
-        consola.start();
-    }
-
-    private static void conectarYAtenderCentral(String host, int port, String cpID) {
-        while (true) {
-            try (var s   = new java.net.Socket(host, port);
-                var in  = new java.io.DataInputStream(s.getInputStream());
-                var out = new java.io.DataOutputStream(s.getOutputStream())) {
-
-                System.out.println("[ENG] Conectado a CENTRAL " + host + ":" + port);
-
-                // 1) Vincular este canal al CP (ENGINE_BIND)
-                send(out, obj("type","ENGINE_BIND","ts",System.currentTimeMillis(),"cp",cpID));
-
-                // 2) Escuchar órdenes
-                while (true) {
-                    JsonObject m = recv(in);
-                    String type = m.get("type").getAsString();
-
-                    if ("START".equals(type)) {
-                        String session = m.get("session").getAsString();
-                        String cp      = m.get("cp").getAsString();
-                        double price   = m.get("price").getAsDouble();
-
-                        
-                        sesionActiva = session; cpIDActual = cp; enMarcha = true;
-                        System.out.println("[ENG] START sesión " + session + " en " + cp + " (precio " + price + ")");
-                        
-                        // Esperar enchufe (o STOP) hasta 10s antes de empezar a telemetrear
-                        long t0Plug = System.currentTimeMillis();
-                        while (enMarcha && !enchufado && session.equals(sesionActiva)) {
-                            if (System.currentTimeMillis() - t0Plug > 10_000) break; // timeout opcional
-                            Thread.sleep(50);
-                        }
-
-                        // Bucle de telemetrías (1s)
-                        double kwh = 0.0, eur = 0.0;
-                        long last = System.currentTimeMillis();
-
-                        while (enMarcha && enchufado && session.equals(sesionActiva)) {
-                            long now = System.currentTimeMillis();
-                            if (now - last < 1000) { Thread.sleep(10); continue; }
-                            last = now;
-
-                            // Simulación sencilla
-                            kwh += potenciaKW / 3600.0;
-                            eur  = kwh * price;
-
-                            send(out, obj("type","TEL","ts",now,"session",session,"cp",cp,"pkw",potenciaKW,"kwh",kwh,"eur",eur));
-                            // NUEVO: espejo de telemetría por Kafka (clave = session)
-                            bus.publish(T_TEL, session, obj("type","TEL","ts",now,"session",session,"cp",cp,"kwh",kwh,"eur",eur));
-                        }
-
-                        // Fin de sesión
-                        String reason;
-                        if (stopByCmd)      reason = "STOP";
-                        else if (!healthy)  reason = "KO";   // opcional: reflejar avería local
-                        else                reason = "OK";
-
-                        send(out, obj(
-                            "type","END","ts",System.currentTimeMillis(),
-                            "session",session,"cp",cp,"reason",reason
-                        ));
-                        System.out.println("[ENG] END sesión " + session + " (" + reason + ")");
-
-                        // Reset flags
-                        stopByCmd = false;
-                        enMarcha = false; sesionActiva = null; cpIDActual = null;
-
-                    }
-                    else if ("CMD".equals(type)) {
-                        String cmd = m.get("cmd").getAsString();
-                        String cp  = m.has("cp") ? m.get("cp").getAsString() : null;
-                        if ("STOP_SUPPLY".equals(cmd)) {
-                            System.out.println("[ENG] CMD STOP_SUPPLY" + (cp!=null?(" "+cp):""));
-                            stopByCmd = true;
-                            enMarcha = false; // el bucle de TEL saldrá
-                        } else {
-                            System.out.println("[ENG] CMD desconocido: " + cmd);
-                        }
-                    }
-                }
-
-            } catch (Exception e) {
-                System.out.println("[ENG] Desconectado de CENTRAL: " + e.getMessage() + " (reintento 1s)");
-                try { Thread.sleep(1000); } catch (InterruptedException ignore) {}
-            }
-        }
+    private static double parseDoubleOr(String s, double def) {
+        try { return Double.parseDouble(s); }
+        catch (Exception e) { return def; }
     }
 
     public static void main(String[] args) throws Exception {
@@ -231,39 +59,232 @@ public class CPEngine {
             System.exit(1);
             return;
         }
-        String host = config.getProperty("engine.centralHost", "127.0.0.1");
-        int puerto = parseIntOr(config.getProperty("engine.centralPort","5000"),5000);
-        int puertoHealth = parseIntOr(config.getProperty("engine.healthPort","6100"),6100);
-        String cpID = config.getProperty("engine.cpId", "CP-001");
-        potenciaKW = parseDoubleOr(config.getProperty("engine.potenciaKW","7.2"),7.2);
 
-        T_CMD = config.getProperty("kafka.topic.cmd","ev.cmd.v1");
-        T_TEL = config.getProperty("kafka.topic.telemetry","ev.telemetry.v1");
-        bus = KafkaBus.from(config); // si kafka.enable=false → NoBus interno
+        // --- Config de simulador
+        cpIDActual     = config.getProperty("engine.cpId", "CP-001");
+        potenciaKW     = parseDoubleOr(config.getProperty("engine.potenciaKW","7.2"), 7.2);
+        duracionDemoSec= parseIntOr(config.getProperty("engine.durationSec", "15"), 15);
+        int puertoHealth = parseIntOr(config.getProperty("engine.healthPort","6100"), 6100);
 
-        bus.subscribe(T_CMD, (com.google.gson.JsonObject m) -> {
-            try {
-                if (!m.has("type") || !"CMD".equals(m.get("type").getAsString())) return;
-                String cp = m.get("cp").getAsString();
-                if (!cpID.equals(cp)) return;
-                String cmd = m.get("cmd").getAsString();
-                switch (cmd) {
-                    case "STOP_SUPPLY" -> { System.out.println("[ENG][KAFKA] STOP"); enMarcha = false; }
-                    case "PAUSE"       -> { System.out.println("[ENG][KAFKA] PAUSE"); enMarcha = false; }
-                    case "RESUME"      -> { System.out.println("[ENG][KAFKA] RESUME? (no-ops aquí)"); }
-                }
-            } catch (Exception ex) { System.err.println("[ENG][KAFKA] " + ex.getMessage()); }
-        });
-         // Cierre limpio del bus al apagar la JVM
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            try { bus.close(); } catch (Exception ignore) {}
-        }, "eng-shutdown"));
+        // --- Topics Kafka (por defecto compatibles con Central)
+        T_TELEMETRY = config.getProperty("kafka.topic.telemetry","ev.telemetry.v1");
+        T_SESSIONS  = config.getProperty("kafka.topic.sessions","ev.sessions.v1");
+        T_CMD       = config.getProperty("kafka.topic.cmd","ev.cmd.v1");
 
-        iniciarHealthServer(puertoHealth);
+        // --- Bus (Kafka)
+        bus = KafkaBus.from(config);
+
+        // --- Arrancar consola local y servidor de salud (JSON)
         iniciarConsola();
-        conectarYAtenderCentral(host, puerto, cpID);
-        
+        iniciarHealthServer(puertoHealth);
+
+        // --- Suscripción a comandos desde Central
+        bus.subscribe(T_CMD, CPEngine::onKafkaCmd);
+
+        System.out.println("[ENG] Listo. Esperando comandos en Kafka topic=" + T_CMD + " cp=" + cpIDActual);
+        // Mantener proceso vivo
+        Object lock = new Object();
+        synchronized (lock) { lock.wait(); }
     }
 
- 
+    // =======================
+    //   HANDLERS KAFKA CMD
+    // =======================
+    private static void onKafkaCmd(JsonObject m) {
+        try {
+            if (m==null || !m.has("type") || !"CMD".equals(m.get("type").getAsString())) return;
+
+            String cmd = m.has("cmd") ? m.get("cmd").getAsString() : "";
+            String cp  = m.has("cp")  ? m.get("cp").getAsString()  : "";
+
+            if (!cpIDActual.equals(cp)) return; // ignorar cmds de otros CP
+
+            switch (cmd) {
+                case "START_SUPPLY" -> {
+                    String ses = m.get("session").getAsString();
+                    double precio = m.has("price") ? m.get("price").getAsDouble() : 0.35;
+                    startSessionAsync(ses, cp, precio);
+                }
+                case "STOP_SUPPLY" -> {
+                    System.out.println("[ENG] STOP_SUPPLY recibido");
+                    enMarcha = false; // el bucle de sesión se cerrará solo y publicará SESSION_END
+                }
+                case "RESUME" -> {
+                    // En este simulador, RESUME no hace nada especial en Engine.
+                    System.out.println("[ENG] RESUME recibido (sin efecto en Engine)");
+                }
+                default -> System.out.println("[ENG] CMD desconocido: " + cmd);
+            }
+        } catch (Exception e) {
+            System.err.println("[ENG][KAFKA] onCmd error: " + e.getMessage());
+        }
+    }
+
+    // =======================
+    //   SESIÓN DE SUMINISTRO
+    // =======================
+    private static void startSessionAsync(String sesionID, String cp, double precioPorKWh) {
+        // Si ya hay sesión, cortamos la anterior
+        if (sesionActiva != null && !sesionActiva.equals(sesionID)) {
+            System.out.println("[ENG] Hay una sesión activa. Se detendrá al iniciar la nueva.");
+            enMarcha = false;
+            // el hilo anterior publicará su SESSION_END
+        }
+        new Thread(() -> runSession(sesionID, cp, precioPorKWh), "eng-session-"+sesionID).start();
+    }
+
+    private static void runSession(String sesionID, String cp, double precioPorKWh) {
+        try {
+            sesionActiva = sesionID;
+            System.out.println("[ENG] START sesión " + sesionID + " en " + cp + " precio = " + precioPorKWh);
+            System.out.println("[ENG] Esperando PLUG... (consola: PLUG/UNPLUG)");
+
+            // Esperar a que se “enchufe” (o cancelación)
+            while (!enchufado && sesionID.equals(sesionActiva)) {
+                Thread.sleep(100);
+            }
+            if (!sesionID.equals(sesionActiva)) {
+                System.out.println("[ENG] Sesión " + sesionID + " cancelada antes de iniciar.");
+                return;
+            }
+
+            enMarcha = true;
+            double kWh = 0.0, eur = 0.0;
+            int seg = 0;
+            long t0 = System.currentTimeMillis();
+            String reason = "OK";
+
+            while (enMarcha && enchufado && sesionID.equals(sesionActiva)) {
+                long t = System.currentTimeMillis();
+                if (t - t0 < 1000) {
+                    Thread.sleep(10);
+                    continue;
+                }
+                t0 = t;
+
+                kWh += potenciaKW / 3600.0;
+                eur = kWh * precioPorKWh;
+
+                // TEL -> Kafka
+                bus.publish(T_TELEMETRY, cp, obj(
+                        "type","TEL","ts",System.currentTimeMillis(),
+                        "session",sesionID,"cp",cp,
+                        "pwr",potenciaKW,
+                        "kwh",kWh,"eur",eur
+                ));
+
+                if (duracionDemoSec > 0 && ++seg >= duracionDemoSec) {
+                    enMarcha = false;
+                    reason = "DEMO_LIMIT";
+                }
+            }
+
+            if (!enchufado && sesionID.equals(sesionActiva)) {
+                reason = "UNPLUGGED";
+            }
+            if (!enMarcha && sesionID.equals(sesionActiva) && !"DEMO_LIMIT".equals(reason) && enchufado) {
+                // STOP_SUPPLY explícito
+                reason = "STOP_SUPPLY";
+            }
+
+            // SESSION_END -> Kafka
+            bus.publish(T_SESSIONS, sesionID, obj(
+                    "type","SESSION_END","ts",System.currentTimeMillis(),
+                    "session",sesionID,"cp",cp,
+                    "kwh",kWh,"eur",eur,"reason",reason
+            ));
+
+            System.out.println("[ENG] END sesión " + sesionID + " (" + reason + ")");
+        } catch (Exception e) {
+            System.err.println("[ENG] runSession error: " + e.getMessage());
+        } finally {
+            enMarcha = false;
+            if (sesionID.equals(sesionActiva)) sesionActiva = null;
+        }
+    }
+
+    // =======================
+    //   HEALTH SERVER (JSON)
+    // =======================
+    public static void iniciarHealthServer (int port) {
+        Thread t = new Thread(() -> {
+            try (var ss = new ServerSocket(port)) {
+                System.out.println("[ENG][HEALTH] Escuchando JSON en " + port);
+                while (true) {
+                    var c = ss.accept();
+                    new Thread(() -> {
+                        try (var in = new DataInputStream(c.getInputStream());
+                             var out = new DataOutputStream(c.getOutputStream())) {
+                            while (true){
+                                JsonObject req = recv(in);     // <-- JSON del Monitor
+                                if (req == null || !req.has("type")) continue;
+                                String tpe = req.get("type").getAsString();
+                                if ("PING".equalsIgnoreCase(tpe)) {
+                                    send(out, obj("type","PONG","ok",healthy,"ts",System.currentTimeMillis()));
+                                } else if ("STATUS".equalsIgnoreCase(tpe)) {
+                                    send(out, obj("type","STATUS",
+                                                  "ok",healthy,
+                                                  "enchufado",enchufado,
+                                                  "enMarcha",enMarcha,
+                                                  "session", sesionActiva==null?"":sesionActiva,
+                                                  "cp", cpIDActual,
+                                                  "ts",System.currentTimeMillis()));
+                                } else {
+                                    send(out, obj("type","ERR","msg","UNKNOWN"));
+                                }
+                            }
+                        }
+                        catch (Exception ignore){}
+                    }, "eng-health-client").start();
+                }
+            } catch (Exception e) {
+                System.err.println("[ENG][HEALTH] ERROR: " + e.getMessage());
+            }
+        }, "eng-health");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    // =======================
+    //   CONSOLA LOCAL
+    // =======================
+    private static void iniciarConsola() {
+        Thread consola = new Thread(() -> {
+            try (var br = new java.io.BufferedReader(new java.io.InputStreamReader(System.in))){
+                System.out.println("[ENG] Comandos: PLUG | UNPLUG | STATUS | OK | KO");
+                for (String line; (line = br.readLine()) != null; ){
+                    switch (line.trim().toUpperCase()) {
+                        case "PLUG" -> {
+                            enchufado = true;
+                            System.out.println("[ENG] PLUG");
+                        }
+                        case "UNPLUG" -> {
+                            enchufado = false;
+                            enMarcha = false;
+                            System.out.println("[ENG] UNPLUG");
+                        }
+                        case "STATUS" -> {
+                            System.out.println("[ENG] Enchufado=" + enchufado +
+                                               " EnMarcha=" + enMarcha +
+                                               " Sesión=" + (sesionActiva==null?"-":sesionActiva));
+                        }
+                        case "OK" -> {
+                            healthy = true;
+                            System.out.println("[ENG] Salud=OK");
+                        }
+                        case "KO" -> {
+                            healthy = false;
+                            System.out.println("[ENG] Salud=KO");
+                        }
+                        default -> {
+                            if (!line.isBlank()) System.out.println("[ENG] Comando desconocido");
+                        }
+                    }
+                }
+            }
+            catch (Exception ignore){}
+        }, "engine-console");
+        consola.setDaemon(true);
+        consola.start();
+    }
 }

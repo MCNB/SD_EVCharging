@@ -54,7 +54,7 @@ public class EVCentral {
     private final java.util.Set<String> stopSolicitado = java.util.concurrent.ConcurrentHashMap.newKeySet(); //Para ver si el END viene de un STOP manual
     private final static java.util.Set<String> driversValidos = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private EventBus bus = new NoBus();
-    private String T_TELEMETRY, T_SESSIONS,T_STATUS, T_CMD;
+    private String T_TELEMETRY, T_SESSIONS, T_CMD;
     
 
     //Para evitar trolleos en el fichero de configuración
@@ -131,7 +131,6 @@ public class EVCentral {
 
         central.T_TELEMETRY = config.getProperty("kafka.topic.telemetry","ev.telemetry.v1");
         central.T_SESSIONS  = config.getProperty("kafka.topic.sessions","ev.sessions.v1");
-        central.T_STATUS    = config.getProperty("kafka.topic.status","ev.status.v1");
         central.T_CMD       = config.getProperty("kafka.topic.cmd","ev.cmd.v1");
         central.bus = KafkaBus.from(config);
 
@@ -194,9 +193,6 @@ public class EVCentral {
                             info.estado = "ACTIVADO";
                             info.lastHb = System.currentTimeMillis();
                         }
-                        // opcional: ACK
-                        //send(out, obj("type","ACK","ts",System.currentTimeMillis(),"msg","REG_CP "+cpID));
-                        //bus.publish(T_STATUS, cpID, obj("type","REG_CP","ts",System.currentTimeMillis(),"cp",cpID,"loc",loc,"price",price));
 
                     }
                     // -------- Monitor: heartbeat --------

@@ -60,23 +60,30 @@ public class CPMonitor {
                     if (now - lastHb >= 1000) { // <-- 1 HB por segundo
                         // Health check puntual (abre/cierra para simplificar y evitar fugas)
                         boolean ok;
-                        try (Socket sEngine = new Socket(engineHost, enginePort);
-                            DataInputStream  inEngine  = new DataInputStream(sEngine.getInputStream());
-                            DataOutputStream outEngine = new DataOutputStream(sEngine.getOutputStream())) {
-                            // JSON health ping (compatible con el Engine nuevo)
-                            send(outEngine, obj("type","PING","ts",System.currentTimeMillis()));
-                            var resp = recv(inEngine);
-                            ok = (resp != null)
-                                 && resp.has("type") && "PONG".equalsIgnoreCase(resp.get("type").getAsString())
-                                 && (!resp.has("ok") || resp.get("ok").getAsBoolean());
-                        } catch (Exception e) { ok = false; }
+                        try {
+                            var addr = new java.net.InetSocketAddress(engineHost, enginePort);
+                            // Conecta con timeout pequeño
+                            try (Socket sEngine = new Socket()) {
+                                sEngine.connect(addr, /*connect-timeout ms*/ 200);
+                                sEngine.setSoTimeout(/*read-timeout ms*/ 200);
 
-                        // Enviar HB
+                                try (DataInputStream  inEngine  = new DataInputStream(sEngine.getInputStream());
+                                    DataOutputStream outEngine = new DataOutputStream(sEngine.getOutputStream())) {
+                                    outEngine.writeUTF("PING");
+                                    ok = "OK".equalsIgnoreCase(inEngine.readUTF());
+                                }
+                            }
+                        } catch (Exception e) {
+                            ok = false; // si falla o expira: reporta KO pero NO bloquees el HB
+                        }
+
+                        // Enviar siempre el HB (aunque el health haya sido KO o haya expirado)
                         send(outC, obj("type","HB","ts",now,"cp",cpId,"ok",ok));
                         lastHb = now;
 
-                        // Drenar ACK(s) de HB (Central suele responder 1 ACK por HB)
-                        drainAcks(inC, /*maxFrames*/ 4, /*label*/ "HB");
+                        // Drenar ACK(s) si los hubiera (opcional)
+                        drainAcks(inC, /*maxFrames*/ 2, "HB");
+
                     }
 
                     // Evita busy-loop

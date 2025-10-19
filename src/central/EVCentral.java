@@ -133,6 +133,7 @@ public class EVCentral {
         central.T_SESSIONS  = config.getProperty("kafka.topic.sessions","ev.sessions.v1");
         central.T_CMD       = config.getProperty("kafka.topic.cmd","ev.cmd.v1");
         central.bus = KafkaBus.from(config);
+        System.out.println("[CENTRAL][KAFKA] bootstrap=" + config.getProperty("kafka.bootstrap","(missing)") + " busImpl=" + central.bus.getClass().getSimpleName());
 
         // Suscripción a comandos (PAUSE/RESUME/STOP) vía Kafka
         central.bus.subscribe(central.T_CMD, central::onKafkaCmd);
@@ -638,6 +639,7 @@ public class EVCentral {
     }
     
     private void onKafkaCmd(com.google.gson.JsonObject m) {
+        System.out.println("[CENTRAL][KAFKA] RX CMD: " + m);
         try {
             if (!m.has("type") || !"CMD".equals(m.get("type").getAsString())) return;
             String cmd = m.get("cmd").getAsString();
@@ -652,37 +654,71 @@ public class EVCentral {
                     String driverId = m.get("driver").getAsString();
                     String cpID     = m.get("cp").getAsString();
 
-                    // === mismo flujo que tu REQ_START por socket ===
                     if (!ensureDriver(driverId)) {
-                        bus.publish(T_SESSIONS, driverId, obj("type","AUTH","ok",false,"driver",driverId,"cp",cpID,"reason","DRIVER_INVALIDO"));
+                        bus.publish(T_SESSIONS, driverId,
+                            obj("type","AUTH","ts",System.currentTimeMillis(),
+                                "ok",false,"driver",driverId,"cp",cpID,"reason","DRIVER_INVALIDO"));
                         return;
                     }
                     CPInfo info = cps.get(cpID);
                     if (info == null) {
-                        bus.publish(T_SESSIONS, driverId, obj("type","AUTH","ok",false,"driver",driverId,"cp",cpID,"reason","CP_DESCONOCIDO"));
+                        bus.publish(T_SESSIONS, driverId,
+                            obj("type","AUTH","ts",System.currentTimeMillis(),
+                                "ok",false,"driver",driverId,"cp",cpID,"reason","CP_DESCONOCIDO"));
                         return;
                     }
 
                     synchronized (info) {
-                        if (!"ACTIVADO".equals(info.estado)) { bus.publish(T_SESSIONS, driverId, obj("type","AUTH","ok",false,"driver",driverId,"cp",cpID,"reason",info.estado)); return; }
-                        if (info.parado)  { bus.publish(T_SESSIONS, driverId, obj("type","AUTH","ok",false,"driver",driverId,"cp",cpID,"reason","PARADO"));   return; }
-                        if (info.ocupado) { bus.publish(T_SESSIONS, driverId, obj("type","AUTH","ok",false,"driver",driverId,"cp",cpID,"reason","OCUPADO"));  return; }
+                        if (!"ACTIVADO".equals(info.estado)) {
+                            bus.publish(T_SESSIONS, driverId,
+                                obj("type","AUTH","ts",System.currentTimeMillis(),
+                                    "ok",false,"driver",driverId,"cp",cpID,"reason",info.estado));
+                            return;
+                        }
+                        if (info.parado) {
+                            bus.publish(T_SESSIONS, driverId,
+                                obj("type","AUTH","ts",System.currentTimeMillis(),
+                                    "ok",false,"driver",driverId,"cp",cpID,"reason","PARADO"));
+                            return;
+                        }
+                        if (info.ocupado) {
+                            bus.publish(T_SESSIONS, driverId,
+                                obj("type","AUTH","ts",System.currentTimeMillis(),
+                                    "ok",false,"driver",driverId,"cp",cpID,"reason","OCUPADO"));
+                            return;
+                        }
 
+                        // Crear sesión
                         String sesId = "S-" + System.currentTimeMillis();
                         info.ocupado = true;
                         var sInf = new SesionInfo(sesId, cpID, driverId);
                         sesiones.put(sesId, sInf);
                         cpSesionesActivas.put(cpID, sesId);
 
-                        // START -> Engine por Kafka (formato unificado CMD/START_SUPPLY)
+                        // Orden al Engine por Kafka
                         bus.publish(T_CMD, cpID, obj("type","CMD","ts",System.currentTimeMillis(),
-                                                     "cmd","START_SUPPLY","session",sesId,"cp",cpID,"price",info.precio));
+                                                    "cmd","START_SUPPLY","session",sesId,"cp",cpID,"price",info.precio));
+
+                        // DB
                         try { dbOpenSession(sesId, cpID, driverId, info.precio); } catch (Exception ignore) {}
-                        // Noticia de sesión
+
+                        // Noticia general para terceros (monitoring, etc.)
                         bus.publish(T_SESSIONS, sesId, obj("type","SESSION_START","ts",System.currentTimeMillis(),
-                                                           "session",sesId,"cp",cpID,"driver",driverId,"price",info.precio));
+                                                        "session",sesId,"cp",cpID,"driver",driverId,"price",info.precio));
+
+                        // *** IMPORTANTE: Respuesta directa al Driver (lo que te faltaba) ***
+                        // ...dentro del synchronized(info) y después de publicar START_SUPPLY y SESSION_START:
+                        bus.publish(T_SESSIONS, driverId,
+                            obj("type","AUTH","ts",System.currentTimeMillis(),
+                                "ok", true,
+                                "driver", driverId,
+                                "cp", cpID,
+                                "session", sesId,
+                                "price", info.precio));
+
                     }
                 }
+
             }
         } catch (Exception e) {
             System.err.println("[CENTRAL][KAFKA] onCmd: " + e.getMessage());

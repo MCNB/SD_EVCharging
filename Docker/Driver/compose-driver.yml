@@ -1,0 +1,12 @@
+services:
+  driver:
+    image: eclipse-temurin:21-jre
+    container_name: driver
+    working_dir: /opt/app
+    volumes:
+      - ./app:/opt/app/app:ro         # driver-app.jar
+      - ./config:/opt/app/config:ro   # driver.config
+      - ./lib:/opt/app/lib:ro
+    command: ["java","-jar","/opt/app/app/driver-app.jar"]
+    stdin_open: true
+    tty: true

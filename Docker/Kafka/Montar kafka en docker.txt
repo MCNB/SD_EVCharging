@@ -84,10 +84,10 @@ docker compose logs -f kafka
 - Creamos los topics
 
 
-docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --topic ev.telemetry.v1 --partitions 1 --replication-factor 1
-docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --topic ev.sessions.v1  --partitions 1 --replication-factor 1
-docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --topic ev.status.v1    --partitions 1 --replication-factor 1
-docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --topic ev.cmd.v1       --partitions 1 --replication-factor 1
+docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --topic ev.telemetry.v1 --partitions 3 --replication-factor 1
+docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --topic ev.sessions.v1  --partitions 3 --replication-factor 1
+docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --topic ev.status.v1 --partitions 1 --replication-factor 1 --config cleanup.policy=compact --config min.cleanable.dirty.ratio=0.1
+docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --topic ev.cmd.v1       --partitions 3 --replication-factor 1
 
 docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
 
@@ -102,14 +102,23 @@ docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhos
 
 
 
+- Para modificar topics
+docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --alter --topic ev.telemetry.v1 --partitions 3
+docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --alter --topic ev.sessions.v1  --partitions 3
+docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --alter --topic ev.cmd.v1       --partitions 3
+
+docker exec -it kafka /opt/kafka/bin/kafka-configs.sh --bootstrap-server localhost:9092 --alter --topic ev.status.v1 --add-config cleanup.policy=compact,min.cleanable.dirty.ratio=0.1
 
 
 
 
 
 
+docker run -d --rm -p 9000:9000 -e KAFKA_BROKERCONNECT=host:port,host:port -e JVM_OPTS="-Xms32M -Xmx64M" -e SERVER_SERVLET_CONTEXTPATH="/" obsidiandynamics/kafdrop:latest
 
 
 
+//=======================================================//
 
 
+-Limpiar mensajes, colas y residuos

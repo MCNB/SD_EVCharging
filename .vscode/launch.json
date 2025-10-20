@@ -1,0 +1,70 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "java",
+            "name": "EVDriver",
+            "request": "launch",
+            "mainClass": "driver.EVDriver",
+            "projectName": "SD_EVCharging_4a04834b"
+        },
+        {
+            "type": "java",
+            "name": "EVCentral",
+            "request": "launch",
+            "mainClass": "central.EVCentral",
+            "projectName": "SD_EVCharging_4a04834b"
+        },
+        {
+            "type": "java",
+            "name": "CPMonitor",
+            "request": "launch",
+            "mainClass": "cp_monitor.CPMonitor",
+            "projectName": "SD_EVCharging_4a04834b"
+        },
+        {
+            "type": "java",
+            "name": "CPEngine",
+            "request": "launch",
+            "mainClass": "cp_engine.CPEngine",
+            "projectName": "SD_EVCharging_4a04834b"
+        },
+        {
+            "type": "java",
+            "name": "Current File",
+            "request": "launch",
+            "mainClass": "${file}"
+        },
+        {
+            "type": "java",
+            "name": "EVCentral",
+            "request": "launch",
+            "mainClass": "central.EVCentral",
+            "projectName": "SD_EVCharging_f4490f20"
+        },
+        {
+            "type": "java",
+            "name": "CPEngine",
+            "request": "launch",
+            "mainClass": "cp_engine.CPEngine",
+            "projectName": "SD_EVCharging_f4490f20"
+        },
+        {
+            "type": "java",
+            "name": "CPMonitor",
+            "request": "launch",
+            "mainClass": "cp_monitor.CPMonitor",
+            "projectName": "SD_EVCharging_f4490f20"
+        },
+        {
+            "type": "java",
+            "name": "EVDriver",
+            "request": "launch",
+            "mainClass": "driver.EVDriver",
+            "projectName": "SD_EVCharging_f4490f20"
+        }
+    ]
+}

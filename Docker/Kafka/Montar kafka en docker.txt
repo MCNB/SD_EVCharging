@@ -1,0 +1,124 @@
+- Estructura de carpetas:
+
+C:\ev-kafka\
+  docker-compose.yml
+  .env
+  config\
+    server.properties
+
+//=======================================================//
+- config/server.properties
+
+# KRaft single-node (sin ZooKeeper)
+process.roles=broker,controller
+node.id=1
+
+controller.listener.names=CONTROLLER
+listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+listeners=PLAINTEXT://:9092,CONTROLLER://:9093
+advertised.listeners=PLAINTEXT://localhost:9092
+inter.broker.listener.name=PLAINTEXT
+
+controller.quorum.voters=1@localhost:9093
+log.dirs=/var/lib/kafka/data
+
+num.partitions=1
+offsets.topic.replication.factor=1
+transaction.state.log.replication.factor=1
+transaction.state.log.min.isr=1
+auto.create.topics.enable=false
+
+//=======================================================//
+- .env
+
+CLUSTER_ID=PEGAR_AQUI_EL_UUID
+
+
+//=======================================================//
+- docker-compose.yml
+
+services:
+  kafka:
+    image: apache/kafka:4.1.0
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      CLUSTER_ID: "${CLUSTER_ID}"
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"
+    volumes:
+      - ./config/server.properties:/etc/kafka/server.properties:ro
+      - kafka_data:/var/lib/kafka/data
+    command: >
+      /bin/bash -lc '
+        if [ ! -f /var/lib/kafka/data/meta.properties ]; then
+          /opt/kafka/bin/kafka-storage.sh format -t "$CLUSTER_ID" -c /etc/kafka/server.properties;
+        fi;
+        exec /opt/kafka/bin/kafka-server-start.sh /etc/kafka/server.properties
+      '
+    restart: unless-stopped
+
+volumes:
+  kafka_data:
+
+//=======================================================//
+
+- Generar CLUSTER_ID
+
+docker run --rm --entrypoint /bin/bash apache/kafka:4.1.0 -lc "/opt/kafka/bin/kafka-storage.sh random-uuid"
+
+Pegamos el resultado en .env
+
+
+//=======================================================//
+
+- Arrancar (se descarga la imagen y crea el contenedor)
+
+cd C:\ev-kafka
+docker compose up -d
+docker compose logs -f kafka
+
+
+//=======================================================//
+
+- Creamos los topics
+
+
+docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --topic ev.telemetry.v1 --partitions 3 --replication-factor 1
+docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --topic ev.sessions.v1  --partitions 3 --replication-factor 1
+docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --topic ev.status.v1 --partitions 1 --replication-factor 1 --config cleanup.policy=compact --config min.cleanable.dirty.ratio=0.1
+docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --topic ev.cmd.v1       --partitions 3 --replication-factor 1
+
+docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+
+
+
+//=======================================================//
+
+- Para testeo
+	- Consumidor: docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic ev.sessions.v1 --from-beginning
+	- Productor: docker exec -it kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic ev.sessions.v1
+	- Mensaje: {"type":"SESSION_START","session":"S-TEST","cp":"CP-001","driver":"D-001","price":0.35}
+
+
+
+- Para modificar topics
+docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --alter --topic ev.telemetry.v1 --partitions 3
+docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --alter --topic ev.sessions.v1  --partitions 3
+docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --alter --topic ev.cmd.v1       --partitions 3
+
+docker exec -it kafka /opt/kafka/bin/kafka-configs.sh --bootstrap-server localhost:9092 --alter --topic ev.status.v1 --add-config cleanup.policy=compact,min.cleanable.dirty.ratio=0.1
+
+
+
+
+
+
+docker run -d --rm -p 9000:9000 -e KAFKA_BROKERCONNECT=host:port,host:port -e JVM_OPTS="-Xms32M -Xmx64M" -e SERVER_SERVLET_CONTEXTPATH="/" obsidiandynamics/kafdrop:latest
+
+
+
+//=======================================================//
+
+
+-Limpiar mensajes, colas y residuos

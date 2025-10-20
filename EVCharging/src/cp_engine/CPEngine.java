@@ -11,6 +11,9 @@ import java.nio.file.Path;
 import java.util.Locale;
 import java.util.Properties;
 
+import com.google.gson.JsonObject;
+import static common.net.Wire.*;
+
 public class CPEngine {
 
     static volatile boolean enchufado = false;
@@ -73,72 +76,43 @@ public class CPEngine {
              var in = new DataInputStream(s.getInputStream());
              var out = new DataOutputStream(s.getOutputStream())) {
 
-                out.writeUTF("ENGINE_BIND " + cpID);
+                //out.writeUTF("ENGINE_BIND " + cpID);
                 //String ack = in.readUTF();
+                send(out, obj("type","ENGINE_BIND","ts",System.currentTimeMillis(),"cp",cpID));
 
-                while (true){
-                    String msg = in.readUTF();
-                    if (msg == null || msg.isBlank()) {
-                        continue;
+                while (true) {
+                    JsonObject m = recv(in);
+                    String type = m.get("type").getAsString();
+
+                    if ("START".equals(type)) {
+                        String session = m.get("session").getAsString();
+                        String cp      = m.get("cp").getAsString();
+                        double price   = m.get("price").getAsDouble();
+
+                        System.out.println("[ENG] START sesión " + session + " en " + cp + " precio = " + price);
+                        System.out.println("[ENG] Esperando PLUG...");
+                        while (!enchufado && session.equals(sesionActiva)) {
+                            Thread.sleep(100);
+                        }
+
+                        if (!session.equals(sesionActiva)) {
+                            break;
+                        }
+
+
+                        enMarcha = true; sesionActiva = session; cpIDActual = cp;
+                        double kwh=0, eur=0; long t0=System.currentTimeMillis();
+                        while (enMarcha && enchufado && session.equals(sesionActiva)) {
+                        long now=System.currentTimeMillis(); if (now-t0<1000){ Thread.sleep(10); continue; } t0=now;
+                        kwh += potenciaKW/3600.0; eur = kwh*price;
+                        send(out, obj("type","TEL","ts",now,"session",session,"cp",cp,"pkw",potenciaKW,"kwh",kwh,"eur",eur));
+                        }
+                        send(out, obj("type","END","ts",System.currentTimeMillis(),"session",session,"cp",cp,"reason", enMarcha? "STOP":"OK"));
+                        enMarcha=false; sesionActiva=null; cpIDActual=null;
                     }
-                    String[] p = msg.trim().split("\\s+");
-                    String comando = p[0].toUpperCase();
-                    
-
-                    switch (comando){
-                        case "START" -> {
-                            
-                            String sesionID = p[1], cp = p[2];
-                            double precioPorkWh = parseDoubleOr(p[3], precio);
-                            sesionActiva = sesionID;
-                            cpIDActual = cp;
-
-                            System.out.println("[ENG] START sesión " + sesionID + " en " + cp + " precio = " + precioPorkWh);
-                            System.out.println("[ENG] Esperando PLUG...");
-                            while (!enchufado && sesionID.equals(sesionActiva)) {
-                                Thread.sleep(100);
-                            }
-
-                            if (!sesionID.equals(sesionActiva)) {
-                                break;
-                            }
-
-                            enMarcha = true;
-                            double kWh = 0.0, eur =0.0;
-                            int seg = 0;
-                            long t0 = System.currentTimeMillis();
-                            while (enMarcha && enchufado && sesionID.equals(sesionActiva)) {
-                                long t = System.currentTimeMillis();
-                                if (t - t0 < 1000) {
-                                    Thread.sleep(10);
-                                    continue;
-                                }
-                                t0 = t;
-                                kWh += potenciaKW / 3600.0;
-                                eur = kWh * precioPorkWh;
-                                String telemetria = String.format(Locale.ROOT,"TEL %s %s %.2f %.5f %.4f",
-                                        sesionID, cp, potenciaKW, kWh, eur);
-                                out.writeUTF(telemetria);
-                                if (duracionDemoSec > 0 && ++seg >= duracionDemoSec) {
-                                    enMarcha = false;
-                                }
-                               
-                            }
-                            out.writeUTF("END " + sesionID + " " + cp);
-                            System.out.println("[ENG] -> END " + sesionID + " " + cp);
-                            enMarcha = false;
-                            sesionActiva = null;
-                            cpIDActual = null;
-                        }
-                        
-                        case "STOP_SUPPLY" -> {
-                            System.out.println("[ENG] STOP_SUPPLY recibido");
-                            enMarcha = false;
-                        }
-                        case "ACK" -> {//Ignora ACK
-                        }
-
-                        default -> System.out.println("[ENG] Comando desconocido: " + msg);
+                    else if ("CMD".equals(type)) {
+                        String cmd = m.get("cmd").getAsString();
+                        if ("STOP_SUPPLY".equals(cmd)) enMarcha=false;
                     }
                 }
             }
@@ -220,4 +194,7 @@ public class CPEngine {
         consola.setDaemon(true);
         consola.start();
     }
+
+
+
 }

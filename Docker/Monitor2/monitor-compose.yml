@@ -1,0 +1,12 @@
+services:
+  monitor:
+    image: eclipse-temurin:21-jre
+    container_name: monitor
+    working_dir: /opt/app
+    volumes:
+      - ./app:/opt/app/app:ro         # monitor-app.jar
+      - ./config:/opt/app/config:ro   # monitor.config
+      - ./lib:/opt/app/lib:ro
+    command: ["java","-jar","/opt/app/app/monitor-app.jar"]
+    stdin_open: true
+    tty: true

@@ -26,12 +26,12 @@ import common.bus.KafkaBus;
 
 public class EVCentral {
     static class CPInfo {
-        String cpID, ubicacion;
-        double precio;
-        String estado = "ACTIVADO";
-        long lastHb = System.currentTimeMillis();
-        boolean ocupado = false;
-        boolean parado = false;
+        volatile String cpID, ubicacion;
+        volatile double precio;
+        volatile String estado = "ACTIVADO";
+        volatile long lastHb = System.currentTimeMillis();
+        volatile boolean ocupado = false;
+        volatile boolean parado = false;
     }
 
     static class SesionInfo {
@@ -81,17 +81,54 @@ public class EVCentral {
         } catch (Exception e) { System.out.println("[CENTRAL][DB] spOpenSession("+sID+","+cpID+") ERROR: " + e.getMessage()); }
     }
 
-    private void dbCloseSession (String sID, String motivo, double kwh, double eur){
+    private void dbCloseSession (String sID, long tsMillis, String motivo, double kwh, double eur){
+        if (DB_URL==null || DB_URL.isBlank()) return;
         try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
-             var st = cn.prepareCall("{call dbo.spCloseSession(?,?,?,?,?)}")) {
+            var st = cn.prepareCall("{call dbo.spCloseSession(?,?,?,?,?)}")) {
             st.setString(1, sID);
-            st.setTimestamp(2, java.sql.Timestamp.from(java.time.Instant.now()),
+            st.setTimestamp(2, new java.sql.Timestamp(tsMillis),
                     java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC")));
             st.setString(3, motivo);
             st.setBigDecimal(4, java.math.BigDecimal.valueOf(kwh).setScale(6, java.math.RoundingMode.HALF_UP));
             st.setBigDecimal(5, java.math.BigDecimal.valueOf(eur).setScale(4, java.math.RoundingMode.HALF_UP));
             st.execute();
-        } catch (Exception e) { System.out.println("[CENTRAL][DB] spCloseSession("+sID+") ERROR: " + e.getMessage()); }
+        } catch (Exception e) {
+            System.out.println("[CENTRAL][DB] spCloseSession("+sID+") ERROR: " + e.getMessage());
+        }
+    }
+
+    private void dbRecoverOpenSessions() {
+        if (DB_URL==null || DB_URL.isBlank()) return;
+        try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+            var ps = cn.prepareStatement("""
+                SELECT s.session_id, s.cp_id, s.driver_id, s.price_eur_kwh, s.t_start
+                FROM dbo.[Session] s
+                WHERE s.t_end IS NULL
+            """);
+            var rs = ps.executeQuery()) {
+
+            int n=0;
+            while (rs.next()) {
+                String sesId  = rs.getString(1);
+                String cpID   = rs.getString(2).toUpperCase(java.util.Locale.ROOT);
+                String driver = rs.getString(3);
+
+                // reconstruye in-memory
+                var info = cps.computeIfAbsent(cpID, _ -> new CPInfo());
+                synchronized (info) {
+                    info.cpID   = cpID;
+                    info.estado = "ESPERANDO_PLUG"; // o "DESCONECTADO" si no hay HB aún
+                    info.ocupado= true;
+                }
+                var sInf = new SesionInfo(sesId, cpID, driver);
+                sesiones.put(sesId, sInf);
+                cpSesionesActivas.put(cpID, sesId);
+                n++;
+            }
+            System.out.println("[CENTRAL][RECOVERY] Sesiones abiertas rehidratadas: " + n);
+        } catch (Exception e) {
+            System.err.println("[CENTRAL][RECOVERY] ERROR: " + e.getMessage());
+        }
     }
 
     public static void main (String[] args) throws Exception {
@@ -148,7 +185,8 @@ public class EVCentral {
         if (consolePanel) {
             central.iniciarPanel();   
         }
-    
+        
+        central.dbRecoverOpenSessions();
         central.iniciarWatchdog();
         central.iniciarHttpStatus(httpPort);
         
@@ -433,20 +471,29 @@ public class EVCentral {
         for (var e : cps.entrySet()) {
             String cpID = e.getKey();
             CPInfo info = e.getValue();
-            String sesion = cpSesionesActivas.getOrDefault(cpID, "-");
-            double kwh=0, eur=0;
-            var sInf = sesiones.get(sesion);
-            if (sInf != null) { 
-                kwh = sInf.kWhAccumulado; eur = sInf.eurAccumulado;
+
+            String estado; boolean ocupado; boolean parado; long last;
+            double precio;
+            synchronized (info) {               // ← snapshot coherente
+                estado = info.estado;
+                ocupado= info.ocupado;
+                parado = info.parado;
+                last   = info.lastHb;
+                precio = info.precio;
             }
-            String est = estadoVisible(info);
+
+            String sesion = cpSesionesActivas.getOrDefault(cpID, "-");
+            var sInf = sesiones.get(sesion);
+            double kwh = (sInf != null) ? sInf.kWhAccumulado : 0.0;
+            double eur = (sInf != null) ? sInf.eurAccumulado : 0.0;
+
             long lag = now - info.lastHb;
 
             if (!first) sb.append(',');
             first = false;
             sb.append("{")
             .append("\"cp\":\"").append(cpID).append("\",")
-            .append("\"estado\":\"").append(est).append("\",")
+            .append("\"estado\":\"").append(estado).append("\",")
             .append("\"parado\":").append(info.parado).append(',')
             .append("\"ocupado\":").append(info.ocupado).append(',')
             .append("\"lastHbMs\":").append(lag).append(',')
@@ -635,20 +682,100 @@ public class EVCentral {
     }
 
     private void onKafkaCmd(com.google.gson.JsonObject m) {
-    try {
-        if (!m.has("type") || !"CMD".equals(m.get("type").getAsString())) return;
+        try {
+            if (!m.has("type") || !"CMD".equals(m.get("type").getAsString())) return;
 
-        // Si usas el "src" para evitar ecos, ignora SOLO los que vengan de CENTRAL, 
-        // pero OJO: REQ_START viene del DRIVER y NO debe ignorarse.
-        String cmd = m.get("cmd").getAsString();
+            // --- Anti-eco: Central publica a T_CMD para el Engine; no debe re-procesarse a sí misma
+            String cmd = m.get("cmd").getAsString();
+            String src = m.has("src") ? m.get("src").getAsString() : "";
+            if ("CENTRAL".equals(src)) return;
 
-        // --- DRIVER -> CENTRAL: solicitud de inicio ---
-        if ("REQ_START".equals(cmd)) {
+            // --- NO REQ_START: STOP/PAUSE/RESUME, etc. ---
+            if (!"REQ_START".equals(cmd)) {
+                switch (cmd) {
+                    case "REQ_STOP":
+                    case "STOP":
+                    case "STOP_SUPPLY": {
+                        String session = m.has("session") ? m.get("session").getAsString() : null;
+                        String cpID    = m.has("cp") ? m.get("cp").getAsString() : null;
+                        if (cpID != null) cpID = cpID.toUpperCase(java.util.Locale.ROOT);
+
+                        // intenta deducir sesión si no viene
+                        if (session == null && cpID != null) {
+                            session = cpSesionesActivas.get(cpID);
+                        }
+                        if (session == null && m.has("driver")) {
+                            String driverId = m.get("driver").getAsString();
+                            for (var e : sesiones.entrySet()) {
+                                var s = e.getValue();
+                                if (driverId.equals(s.driverID)) {
+                                    session = e.getKey();
+                                    cpID = s.cpID;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (session != null && cpID != null) {
+                            if (m.has("driver")) {
+                                String driverId = m.get("driver").getAsString();
+                                bus.publish(T_SESSIONS, driverId,
+                                    obj("type","STOP_ACK","ts",System.currentTimeMillis(),
+                                        "ok",true,"session",session,"cp",cpID,"src","CENTRAL"));
+                            }
+                            bus.publish(T_CMD, cpID,
+                                obj("type","CMD","ts",System.currentTimeMillis(),"src","CENTRAL",
+                                    "cmd","STOP_SUPPLY","session",session,"cp",cpID));
+                        } else {
+                            if (m.has("driver")) {
+                                String driverId = m.get("driver").getAsString();
+                                bus.publish(T_SESSIONS, driverId,
+                                    obj("type","STOP_ACK","ts",System.currentTimeMillis(),
+                                        "ok",false,"reason","SESSION_NOT_FOUND","src","CENTRAL"));
+                            }
+                        }
+                        return;
+                    }
+
+                    case "REQ_PAUSE":
+                    case "PAUSE": {
+                        String session = m.has("session") ? m.get("session").getAsString() : null;
+                        String cpID    = m.has("cp") ? m.get("cp").getAsString() : null;
+                        if (cpID != null) cpID = cpID.toUpperCase(java.util.Locale.ROOT);
+                        if (session == null && cpID != null) session = cpSesionesActivas.get(cpID);
+                        if (session != null && cpID != null) {
+                            bus.publish(T_CMD, cpID,
+                                obj("type","CMD","ts",System.currentTimeMillis(),"src","CENTRAL",
+                                    "cmd","PAUSE_SUPPLY","session",session,"cp",cpID));
+                        }
+                        return;
+                    }
+
+                    case "REQ_RESUME":
+                    case "RESUME": {
+                        String session = m.has("session") ? m.get("session").getAsString() : null;
+                        String cpID    = m.has("cp") ? m.get("cp").getAsString() : null;
+                        if (cpID != null) cpID = cpID.toUpperCase(java.util.Locale.ROOT);
+                        if (session == null && cpID != null) session = cpSesionesActivas.get(cpID);
+                        if (session != null && cpID != null) {
+                            bus.publish(T_CMD, cpID,
+                                obj("type","CMD","ts",System.currentTimeMillis(),"src","CENTRAL",
+                                    "cmd","RESUME_SUPPLY","session",session,"cp",cpID));
+                        }
+                        return;
+                    }
+
+                    default:
+                        return; // desconocido para Central
+                }
+            }
+
+            // --- DRIVER -> CENTRAL: REQ_START ---
             String driverId = m.get("driver").getAsString();
             String cpID     = m.get("cp").getAsString();
-            if (cpID != null) cpID = cpID.toUpperCase(java.util.Locale.ROOT); // normaliza
+            if (cpID != null) cpID = cpID.toUpperCase(java.util.Locale.ROOT);
 
-            // 1) Validación de driver
+            // 1) Valida driver
             if (!ensureDriver(driverId)) {
                 bus.publish(T_SESSIONS, driverId,
                     obj("type","AUTH","ts",System.currentTimeMillis(),
@@ -656,7 +783,7 @@ public class EVCentral {
                 return;
             }
 
-            // 2) CP existe
+            // 2) Valida CP
             CPInfo info = cps.get(cpID);
             if (info == null) {
                 bus.publish(T_SESSIONS, driverId,
@@ -665,72 +792,74 @@ public class EVCentral {
                 return;
             }
 
-            // 3) Estado CP
+            // 3) Reservar y construir mensajes bajo lock; publicar fuera
+            String sesId = null;
+            double price = 0.0;
+            com.google.gson.JsonObject authMsg = null, startCmd = null, sessStart = null;
+
             synchronized (info) {
                 if (!"ACTIVADO".equals(info.estado)) {
-                    bus.publish(T_SESSIONS, driverId,
-                        obj("type","AUTH","ts",System.currentTimeMillis(),
-                            "driver",driverId,"cp",cpID,"ok",false,"reason",info.estado,"src","CENTRAL"));
-                    return;
+                    authMsg = obj("type","AUTH","ts",System.currentTimeMillis(),
+                                "driver",driverId,"cp",cpID,"ok",false,"reason",info.estado,"src","CENTRAL");
+                } else if (info.parado) {
+                    authMsg = obj("type","AUTH","ts",System.currentTimeMillis(),
+                                "driver",driverId,"cp",cpID,"ok",false,"reason","PARADO","src","CENTRAL");
+                } else if (info.ocupado) {
+                    authMsg = obj("type","AUTH","ts",System.currentTimeMillis(),
+                                "driver",driverId,"cp",cpID,"ok",false,"reason","OCUPADO","src","CENTRAL");
+                } else {
+                    sesId = "S-" + System.currentTimeMillis();
+                    price = info.precio;
+                    info.ocupado = true;
+                    info.estado  = "ESPERANDO_PLUG"; // ← clave para la UX/flow
+
+                    var sInf = new SesionInfo(sesId, cpID, driverId);
+                    sesiones.put(sesId, sInf);
+                    cpSesionesActivas.put(cpID, sesId);
+
+                    try { dbOpenSession(sesId, cpID, driverId, price); } catch (Exception ignore) {}
+
+                    long now = System.currentTimeMillis();
+                    authMsg   = obj("type","AUTH","ts",now,"driver",driverId,"cp",cpID,
+                                    "ok",true,"session",sesId,"price",price,"src","CENTRAL");
+
+                    startCmd  = obj("type","CMD","ts",now,"src","CENTRAL",
+                                    "cmd","START_SUPPLY","session",sesId,"cp",cpID,"price",price);
+
+                    sessStart = obj("type","SESSION_START","ts",now,"src","CENTRAL",
+                                    "session",sesId,"cp",cpID,"driver",driverId,"price",price);
                 }
-                if (info.parado) {
-                    bus.publish(T_SESSIONS, driverId,
-                        obj("type","AUTH","ts",System.currentTimeMillis(),
-                            "driver",driverId,"cp",cpID,"ok",false,"reason","PARADO","src","CENTRAL"));
-                    return;
-                }
-                if (info.ocupado) {
-                    bus.publish(T_SESSIONS, driverId,
-                        obj("type","AUTH","ts",System.currentTimeMillis(),
-                            "driver",driverId,"cp",cpID,"ok",false,"reason","OCUPADO","src","CENTRAL"));
-                    return;
-                }
+            } // fin synchronized(info)
 
-                // 4) Crear sesión y pasar a OCUPADO
-                String sesId = "S-" + System.currentTimeMillis();
-                info.ocupado = true;
-                var sInf = new SesionInfo(sesId, cpID, driverId);
-                sesiones.put(sesId, sInf);
-                cpSesionesActivas.put(cpID, sesId);
-
-                // DB (si la tienes)
-                try { dbOpenSession(sesId, cpID, driverId, info.precio); } catch (Exception ignore) {}
-
-                // 5) -> Driver: AUTORIZACIÓN OK por ev.sessions.v1 (key = driverId)
-                bus.publish(T_SESSIONS, driverId,
-                    obj("type","AUTH","ts",System.currentTimeMillis(),
-                        "driver",driverId,"cp",cpID,"ok",true,"session",sesId,"price",info.precio,"src","CENTRAL"));
-
-                // 6) -> Engine: START por ev.cmd.v1 (key = cpID), marcando src CENTRAL
-                bus.publish(T_CMD, cpID,
-                    obj("type","CMD","ts",System.currentTimeMillis(),"src","CENTRAL",
-                        "cmd","START_SUPPLY","session",sesId,"cp",cpID,"price",info.precio));
-
-                // 7) Noticia de sesión para quien consuma (opcional)
-                bus.publish(T_SESSIONS, sesId,
-                    obj("type","SESSION_START","ts",System.currentTimeMillis(),"src","CENTRAL",
-                        "session",sesId,"cp",cpID,"driver",driverId,"price",info.precio));
+            // 4) Publicaciones FUERA del lock
+            if (authMsg != null) bus.publish(T_SESSIONS, driverId, authMsg);
+            if (startCmd != null && sessStart != null) {
+                bus.publish(T_CMD,      cpID,  startCmd);
+                bus.publish(T_SESSIONS, sesId, sessStart);
             }
-            return;
-        }
 
-        // --- Otros comandos (STOP_SUPPLY/PAUSE/RESUME) ---
-        // Aquí deja tu lógica actual, pero recuerda: si pones src:"CENTRAL" al publicar,
-        // filtra esos en el consumer para no auto-republicar.
-        // ...
-    } catch (Exception e) {
-        System.err.println("[CENTRAL][KAFKA] onCmd: " + e.getMessage());
+        } catch (Exception e) {
+            System.err.println("[CENTRAL][KAFKA] onCmd: " + e.getMessage());
+        }
     }
-}
 
     private void onKafkaTelemetry(com.google.gson.JsonObject m) {
         try {
             if (!m.has("type") || !"TEL".equals(m.get("type").getAsString())) return;
             String ses = m.get("session").getAsString();
+            String cpID  = m.get("cp").getAsString().toUpperCase(java.util.Locale.ROOT);
+
             double kwh = m.get("kwh").getAsDouble();
             double eur = m.get("eur").getAsDouble();
+
             var sInf = sesiones.get(ses);
             if (sInf != null) { sInf.kWhAccumulado = kwh; sInf.eurAccumulado = eur; }
+
+            var info = cps.get(cpID);
+            if (info != null) synchronized (info) {
+                if (!"SUMINISTRANDO".equals(info.estado)) info.estado = "SUMINISTRANDO";
+            }
+
         } catch (Exception e) {
             System.err.println("[CENTRAL][KAFKA] TEL: " + e.getMessage());
         }
@@ -739,14 +868,19 @@ public class EVCentral {
     private void onKafkaSessions(com.google.gson.JsonObject m) {
         try {
             if (!m.has("type")) return;
-            String t = m.get("type").getAsString();
-            if (!"SESSION_END".equals(t)) return;
+            if (!"SESSION_END".equals(m.get("type").getAsString())) return;
 
             String sesId = m.get("session").getAsString();
             String cpID  = m.get("cp").getAsString();
+            if (cpID != null) cpID = cpID.toUpperCase(java.util.Locale.ROOT);
+
+            long tsEnd = m.has("ts") ? m.get("ts").getAsLong() : System.currentTimeMillis();
             double kwh   = m.has("kwh") ? m.get("kwh").getAsDouble() : 0.0;
             double eur   = m.has("eur") ? m.get("eur").getAsDouble() : 0.0;
             String reason= m.has("reason") ? m.get("reason").getAsString() : "OK";
+
+            boolean eraSTOP = stopSolicitado.remove(sesId);
+            if (eraSTOP && "OK".equals(reason)) reason = "STOP_REQUESTED";
 
             sesiones.remove(sesId);
             cpSesionesActivas.remove(cpID, sesId);
@@ -757,7 +891,7 @@ public class EVCentral {
                 if (!info.parado && !"AVERIADO".equals(info.estado)) info.estado = "ACTIVADO";
             }
 
-            try { dbCloseSession(sesId, reason, kwh, eur); } catch (Exception ignore) {}
+            try { dbCloseSession(sesId, tsEnd,reason, kwh, eur); } catch (Exception ignore) {}
 
         } catch (Exception e) {
             System.err.println("[CENTRAL][KAFKA] SESSION_END: " + e.getMessage());

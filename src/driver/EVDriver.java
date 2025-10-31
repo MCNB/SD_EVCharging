@@ -86,14 +86,19 @@ public class EVDriver {
     private static void flujoSolicitud(EventBus bus, String T_CMD, LinkedBlockingQueue<JsonObject> q,
                                        String driverID, String cp, int authTimeoutMs) throws Exception {
         // 1) Publica REQ_START por Kafka
-        JsonObject req = obj("type","CMD","cmd","REQ_START","ts",System.currentTimeMillis(),"driver",driverID,"cp",cp);
+        JsonObject req = obj("type","CMD","cmd","REQ_START","ts",System.currentTimeMillis(),
+                     "driver",driverID,"cp",cp,"src","DRIVER");
         bus.publish(T_CMD, driverID, req);
+        
         System.out.println("[DRV] CMD -> " + req);
 
         // 2) Espera AUTH dirigido a este driver
         JsonObject auth = waitFor(q, authTimeoutMs, m ->
-            m.has("type") && "AUTH".equals(m.get("type").getAsString())
-            && m.has("driver") && driverID.equals(m.get("driver").getAsString())
+            m.has("type") &&
+            "AUTH".equals(m.get("type").getAsString()) &&
+            driverID.equals(m.get("driver").getAsString()) &&
+            cp.equalsIgnoreCase(m.get("cp").getAsString())
+
         );
 
         if (auth == null) {

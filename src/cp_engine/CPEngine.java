@@ -78,26 +78,46 @@ public class CPEngine {
         Thread.currentThread().join();
     }
 
-    private static void startSupply(EventBus bus, String T_TELEMETRY, String T_SESSIONS,
-                                    String cp, String sesionID, double precio) {
+    static void startSupply(EventBus bus, String T_TELEMETRY, String T_SESSIONS,String cp, String sesionID, double precio) {
         new Thread(() -> {
+            final String thisSession = sesionID;
+            double kWh = 0.0, eur = 0.0;
             try {
-                sesionActiva = sesionID;
-                cpIDActual = cp;
+                // -- Estado de sesión --
+                sesionActiva = thisSession;
+                cpIDActual   = cp;
+                enMarcha     = false;
+                enchufado    = false; // ← exige PLUG nuevo SIEMPRE
 
-                System.out.println("[ENG] START sesión " + sesionID + " en " + cp + " precio=" + precio);
+                // ACK temprano de espera
+                bus.publish(T_SESSIONS, thisSession,
+                    obj("type","WAITING_PLUG","ts",System.currentTimeMillis(),
+                        "session",thisSession,"cp",cp,"src","ENGINE"));
+
                 System.out.println("[ENG] Esperando PLUG...");
-                while (!enchufado && sesionID.equals(sesionActiva)) {
+                while (!enchufado && thisSession.equals(sesionActiva)) {
                     Thread.sleep(100);
                 }
-                if (!sesionID.equals(sesionActiva)) return; // abortada
+
+                // Si nos “pisan” la sesión, CIERRA explícitamente
+                if (!thisSession.equals(sesionActiva)) {
+                    bus.publish(T_SESSIONS, thisSession,
+                        obj("type","SESSION_END","ts",System.currentTimeMillis(),
+                            "session",thisSession,"cp",cp,"kwh",0.0,"eur",0.0,
+                            "reason","ABORTED_SUPERSEDED","src","ENGINE"));
+                    return;
+                }
+
+                // (Opcional) CHARGING_STARTED
+                bus.publish(T_SESSIONS, thisSession,
+                    obj("type","CHARGING_STARTED","ts",System.currentTimeMillis(),
+                        "session",thisSession,"cp",cp,"src","ENGINE"));
 
                 enMarcha = true;
-                double kWh = 0.0, eur = 0.0;
+
                 int seg = 0;
                 long t0 = System.currentTimeMillis();
-
-                while (enMarcha && enchufado && sesionID.equals(sesionActiva)) {
+                while (enMarcha && enchufado && thisSession.equals(sesionActiva)) {
                     long t = System.currentTimeMillis();
                     if (t - t0 < 1000) { Thread.sleep(10); continue; }
                     t0 = t;
@@ -105,28 +125,25 @@ public class CPEngine {
                     kWh += potenciaKW / 3600.0;
                     eur  = kWh * precio;
 
-                    JsonObject tel = obj("type","TEL","ts",t,
-                                         "session",sesionID,"cp",cp,
-                                         "power",potenciaKW,"kwh",kWh,"eur",eur);
-                    bus.publish(T_TELEMETRY, sesionID, tel);
+                    bus.publish(T_TELEMETRY, thisSession,
+                        obj("type","TEL","ts",t,"session",thisSession,"cp",cp,
+                            "power",potenciaKW,"kwh",kWh,"eur",eur,"src","ENGINE"));
 
-                    if (duracionDemoSec > 0 && ++seg >= duracionDemoSec) {
-                        enMarcha = false;
-                    }
+                    if (duracionDemoSec > 0 && ++seg >= duracionDemoSec) enMarcha = false;
                 }
 
-                // Fin de sesión: publicamos SESSION_END
-                JsonObject end = obj("type","SESSION_END","ts",System.currentTimeMillis(),
-                                     "session",sesionID,"cp",cp,"kwh",kWh,"eur",eur,"reason","OK");
-                bus.publish(T_SESSIONS, sesionID, end);
+                bus.publish(T_SESSIONS, thisSession,
+                    obj("type","SESSION_END","ts",System.currentTimeMillis(),
+                        "session",thisSession,"cp",cp,"kwh",kWh,"eur",eur,
+                        "reason","OK","src","ENGINE"));
 
-                System.out.println("[ENG] -> SESSION_END " + sesionID + " " + cp);
             } catch (Exception e) {
                 System.err.println("[ENG] startSupply ERR: " + e.getMessage());
             } finally {
                 enMarcha = false;
+                enchufado = false;   // ← CRÍTICO: no heredar PLUG
                 sesionActiva = null;
-                cpIDActual = null;
+                cpIDActual   = null;
             }
         }, "eng-supply-" + sesionID).start();
     }

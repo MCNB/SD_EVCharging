@@ -232,11 +232,11 @@ public class EVCentral {
                             info.estado = "ACTIVADO";
                             info.lastHb = System.currentTimeMillis();
                         }
-
+                         try { dbUpsertCP(cpID, loc, price); } catch (Exception ignore) {}
                     }
                     // -------- Monitor: heartbeat --------
                     case "HB" -> {
-                        String cpID = msg.get("cp").getAsString();
+                        String cpID = msg.get("cp").getAsString().toUpperCase(java.util.Locale.ROOT);
                         boolean ok  = msg.get("ok").getAsBoolean();
                         CPInfo info = cps.get(cpID);
                         if (info == null) break;
@@ -589,6 +589,32 @@ public class EVCentral {
         } 
         catch (Exception e) {
             System.err.println("[CENTRAL][DB] dbLoadDrivers ERROR: " + e.getMessage()); 
+        }
+    }
+    // Crea/actualiza el CP en la tabla dbo.ChargingPoint (idempotente)
+    private static void dbUpsertCP(String cpID, String loc, double price) {
+        if (DB_URL == null || DB_URL.isBlank()) return;
+        final String sql = """
+            MERGE dbo.ChargingPoint AS t
+            USING (SELECT ? AS cp_id, ? AS location_tag, ? AS price_eur_kwh) AS s
+                (cp_id, location_tag, price_eur_kwh)
+            ON (t.cp_id = s.cp_id)
+            WHEN MATCHED THEN
+                UPDATE SET t.location_tag = s.location_tag,
+                        t.price_eur_kwh = s.price_eur_kwh
+            WHEN NOT MATCHED THEN
+                INSERT (cp_id, location_tag, price_eur_kwh)
+                VALUES (s.cp_id, s.location_tag, s.price_eur_kwh);
+        """;
+        try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+            var ps = cn.prepareStatement(sql)) {
+            ps.setString(1, cpID);
+            ps.setString(2, loc);
+            ps.setBigDecimal(3, java.math.BigDecimal.valueOf(price).setScale(4, java.math.RoundingMode.HALF_UP));
+            ps.executeUpdate();
+            System.out.println("[CENTRAL][DB] CP upsert: " + cpID + " (" + loc + ", " + price + ")");
+        } catch (Exception e) {
+            System.err.println("[CENTRAL][DB] dbUpsertCP ERROR: " + e.getMessage());
         }
     }
 

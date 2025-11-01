@@ -37,19 +37,20 @@ public class EVDriver {
         // Cola de eventos entrantes
         final LinkedBlockingQueue<JsonObject> q = new LinkedBlockingQueue<>();
 
-        // Suscripción global a ev.sessions.v1: volcamos TODO a la cola y filtramos en waitFor(...)
+        // Suscripción global a ev.sessions.v1: volcamos todo a la cola y filtramos en waitFor(...)
         bus.subscribe(T_SESSIONS, msg -> {
             try {
                 q.offer(msg);
-                // Si quieres ver lo que llega, descomenta:
+                // Si quieremos ver lo que llega
                 // System.out.println("[DRV] evt@SESS: " + msg);
             } catch (Exception e) {
                 System.err.println("[DRV] subscribe error: " + e.getMessage());
             }
         });
 
-        // Entrada manual o por fichero (como antes)
+        // Entrada manual o por fichero
         List<String> cps = null;
+
         if (!filePath.isEmpty()) {
             Path f = Path.of(filePath).toAbsolutePath().normalize();
             if (Files.isRegularFile(f)) {
@@ -67,7 +68,7 @@ public class EVDriver {
                 i++;
                 System.out.println("[DRV] ("+i+"/"+n+") solicitando "+cp+"…");
                 flujoSolicitud(bus, T_CMD, q, driverID, cp, authTimeoutMs);
-                Thread.sleep(4000); // como antes
+                Thread.sleep(4000);
             }
             System.out.println("[DRV] Fichero procesado. Fin.");
         } else {

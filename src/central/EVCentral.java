@@ -172,11 +172,11 @@ public class EVCentral {
         central.bus = KafkaBus.from(config);
         System.out.println("[CENTRAL][KAFKA] bootstrap=" + config.getProperty("kafka.bootstrap","(missing)") + " busImpl=" + central.bus.getClass().getSimpleName());
 
-        // Suscripción a comandos (PAUSE/RESUME/STOP) vía Kafka
+        // Suscripción a comandos (PAUSE/RESUME/STOP) vía Kafka ev.cmd.v1
         central.bus.subscribe(central.T_CMD, central::onKafkaCmd);
-        // Suscripción a eventos que ahora llegan por Kafka desde ENGINE
+        // Suscripción a eventos llegan por Kafka desde ENGINE ev.telemetry.v1
         central.bus.subscribe(central.T_TELEMETRY, central::onKafkaTelemetry);
-        // IMPORTANTE: para cerrar sesiones recibidas por Kafka (ev.sessions.v1)
+        // Suscripción a sesiones recibidas por Kafka (ev.sessions.v1)
         central.bus.subscribe(central.T_SESSIONS, central::onKafkaSessions);
 
         // Cierre limpio al terminar la JVM
@@ -315,17 +315,17 @@ public class EVCentral {
     private static void clearConsole (){
         try {
             String os = System.getProperty("os.name", "").toLowerCase();
-            if (os.contains("win")) {                       // Windows
+            if (os.contains("win")) {                      
             new ProcessBuilder("cmd", "/c", "cls")
-                .inheritIO()                               // usa la misma TTY
+                .inheritIO()                              
                 .start().waitFor();
             } 
-            else {                                        // Linux / macOS
+            else {                                      
                 System.out.print("\033[H\033[2J");
                 System.out.flush();
             }
         } catch (Exception e) {
-            // Plan C: si todo falla, “desplaza” la pantalla
+          
             for (int i = 0; i < 60; i++) System.out.println();
         }
     }
@@ -407,7 +407,7 @@ public class EVCentral {
 
     private void handleStatusJson (HttpExchange ex) {
         try {
-            String json = buildStatusJson(); // ver abajo
+            String json = buildStatusJson();
             byte[] body = json.getBytes(StandardCharsets.UTF_8);
             ex.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
             ex.sendResponseHeaders(200, body.length);
@@ -591,7 +591,7 @@ public class EVCentral {
             System.err.println("[CENTRAL][DB] dbLoadDrivers ERROR: " + e.getMessage()); 
         }
     }
-    // Crea/actualiza el CP en la tabla dbo.ChargingPoint (idempotente)
+
     private static void dbUpsertCP(String cpID, String loc, double price) {
         if (DB_URL == null || DB_URL.isBlank()) return;
         final String sql = """
@@ -650,9 +650,9 @@ public class EVCentral {
         }
     }
 
-    private void handleCmd(com.sun.net.httpserver.HttpExchange ex) { // GET /cmd?op=PAUSE&cp=CP-001   |  RESUME  |  STOP
+    private void handleCmd(com.sun.net.httpserver.HttpExchange ex) { 
         try {
-            var q = ex.getRequestURI().getQuery(); // op=...&cp=...
+            var q = ex.getRequestURI().getQuery();
             String op=null, cp=null;
             if (q != null) {
                 for (String kv : q.split("&")) {
@@ -923,7 +923,7 @@ public class EVCentral {
             System.err.println("[CENTRAL][KAFKA] SESSION_END: " + e.getMessage());
         }
     }
-        // --- Helpers sin publicar al bus (evitan eco/bucles) ---
+   
     private void applyPauseLocal(String cpID){
         CPInfo info = cps.get(cpID);
         if (info == null) return;
@@ -938,7 +938,7 @@ public class EVCentral {
             if (!"AVERIADO".equals(info.estado)) info.estado = "ACTIVADO";
         }
     }
-    /** Marca que esperamos END por STOP (no publica nada). */
+  
     private void markStopRequested(String cpID){
         String sId = cpSesionesActivas.get(cpID);
         if (sId != null) stopSolicitado.add(sId);

@@ -3,8 +3,8 @@ services:
     image: apache/kafka:4.1.0
     container_name: kafka
     ports:
-      - "9092:9092"   # interno (otros contenedores)
-      - "9094:9094"   # externo (tu host)
+      - "9092:9092"   # interno
+      - "9094:9094"   # externo
     environment:
       CLUSTER_ID: "${CLUSTER_ID}"
       KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"

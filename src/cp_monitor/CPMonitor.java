@@ -58,7 +58,6 @@ public class CPMonitor {
                 while (true) {
                     long now = System.currentTimeMillis();
                     if (now - lastHb >= 1000) { // <-- 1 HB por segundo
-                        // Health check puntual (abre/cierra para simplificar y evitar fugas)
                         boolean ok;
                         try {
                             var addr = new java.net.InetSocketAddress(engineHost, enginePort);
@@ -74,7 +73,7 @@ public class CPMonitor {
                                 }
                             }
                         } catch (Exception e) {
-                            ok = false; // si falla o expira: reporta KO pero NO bloquees el HB
+                            ok = false; // si falla o expira: reporta KO pero NO bloquea el HB
                         }
 
                         // Enviar siempre el HB (aunque el health haya sido KO o haya expirado)

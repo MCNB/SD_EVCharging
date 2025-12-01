@@ -32,7 +32,7 @@ import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
 import com.google.gson.JsonParser;
-
+import java.nio.file.StandardOpenOption;
 
 
 public class EVCentral {
@@ -80,6 +80,9 @@ public class EVCentral {
     private final java.util.concurrent.ConcurrentMap<String,String> cpKeys = new java.util.concurrent.ConcurrentHashMap<>();
     private EventBus bus = new NoBus();
     private String T_TELEMETRY, T_SESSIONS, T_CMD;
+
+    private static Path auditPath;
+    private static final Object auditLock = new Object();
     
 
     //Para evitar trolleos en el fichero de configuración
@@ -184,6 +187,17 @@ public class EVCentral {
         else {
             dbLoadCPs();
             dbLoadDrivers();
+        }
+
+        String auditFile = config.getProperty("central.auditFile","logs/central_audit.log");
+        try {
+            auditPath = Path.of(auditFile).toAbsolutePath().normalize();
+            Path parent = auditPath.getParent();
+            if (parent != null) Files.createDirectories(parent);
+            System.out.println("[CENTRAL][AUDIT] Log en " + auditPath);
+        } catch (Exception e) {
+            System.err.println("[CENTRAL][AUDIT] No se pudo preparar el log: " + e.getMessage());
+            auditPath = null; // fallback: solo consola
         }
 
         boolean consolePanel = Boolean.parseBoolean(config.getProperty("central.consolepanel","false"));
@@ -657,8 +671,8 @@ public class EVCentral {
         // Si no hay BD configurada, aceptamos todo y solo generamos la clave
         if (DB_URL == null || DB_URL.isBlank()) {
             String key = getOrCreateCpKey(cpId);
-            System.out.println("[CENTRAL][AUTH_CP] WARNING: sin DB_URL, aceptando CP=" + cpId +
-                               " ip=" + remoteIp);
+            audit("AUTH_CP_OK", "CP=" + cpId + " ip=" + remoteIp,
+                  "DB_URL vacía; clave generada=" + key);
             return new AuthResult(true, key, null);
         }
 
@@ -669,8 +683,8 @@ public class EVCentral {
             ps.setString(1, cpId);
             try (var rs = ps.executeQuery()) {
                 if (!rs.next()) {
-                    System.out.println("[CENTRAL][AUTH_CP] FAIL cp=" + cpId +
-                                       " ip=" + remoteIp + " reason=NOT_REGISTERED");
+                    audit("AUTH_CP_FAIL", "CP=" + cpId + " ip=" + remoteIp,
+                          "reason=NOT_REGISTERED");
                     return new AuthResult(false, null, "NOT_REGISTERED");
                 }
 
@@ -678,26 +692,26 @@ public class EVCentral {
                 String status   = rs.getString("status");
 
                 if (!"ACTIVO".equalsIgnoreCase(status)) {
-                    System.out.println("[CENTRAL][AUTH_CP] FAIL cp=" + cpId +
-                                       " ip=" + remoteIp + " reason=NOT_ACTIVE(" + status + ")");
+                    audit("AUTH_CP_FAIL", "CP=" + cpId + " ip=" + remoteIp,
+                          "reason=NOT_ACTIVE status=" + status);
                     return new AuthResult(false, null, "NOT_ACTIVE");
                 }
 
                 if (!dbSecret.equals(secret)) {
-                    System.out.println("[CENTRAL][AUTH_CP] FAIL cp=" + cpId +
-                                       " ip=" + remoteIp + " reason=BAD_SECRET");
+                    audit("AUTH_CP_FAIL", "CP=" + cpId + " ip=" + remoteIp,
+                          "reason=BAD_SECRET");
                     return new AuthResult(false, null, "BAD_SECRET");
                 }
             }
 
             String key = getOrCreateCpKey(cpId);
-            System.out.println("[CENTRAL][AUTH_CP] OK cp=" + cpId + " ip=" + remoteIp +
-                               " key=" + key);
+            audit("AUTH_CP_OK", "CP=" + cpId + " ip=" + remoteIp,
+                  "Clave asignada=" + key);
             return new AuthResult(true, key, null);
 
         } catch (Exception e) {
-            System.err.println("[CENTRAL][AUTH_CP] ERROR cp=" + cpId + " ip=" + remoteIp +
-                               " msg=" + e.getMessage());
+            audit("AUTH_CP_ERROR", "CP=" + cpId + " ip=" + remoteIp,
+                  "reason=DB_ERROR msg=" + e.getMessage());
             return new AuthResult(false, null, "DB_ERROR");
         }
     }
@@ -812,6 +826,8 @@ public class EVCentral {
         applyPauseLocal(cpID);
         markStopRequested(cpID);
 
+        audit("CP_CMD", "CP=" + cpID, "op=PAUSE via HTTP_PANEL");
+
         com.google.gson.JsonObject inner = obj("type","CMD","src","CENTRAL","ts",System.currentTimeMillis(),
                                                "cmd","STOP_SUPPLY","cp",cpID);
         com.google.gson.JsonObject enc = encryptForCp(cpID, inner);
@@ -823,6 +839,8 @@ public class EVCentral {
     private String resumeCp(String cpID){
         applyResumeLocal(cpID);
 
+        audit("CP_CMD", "CP=" + cpID, "op=RESUME via HTTP_PANEL");
+
         com.google.gson.JsonObject inner = obj("type","CMD","src","CENTRAL","ts",System.currentTimeMillis(),
                                                "cmd","RESUME","cp",cpID);
         com.google.gson.JsonObject enc = encryptForCp(cpID, inner);
@@ -833,6 +851,8 @@ public class EVCentral {
 
     private String stopCp(String cpID){
         markStopRequested(cpID);
+
+        audit("CP_CMD", "CP=" + cpID, "op=STOP via HTTP_PANEL");
 
         com.google.gson.JsonObject inner = obj("type","CMD","src","CENTRAL","ts",System.currentTimeMillis(),
                                                "cmd","STOP_SUPPLY","cp",cpID);
@@ -944,8 +964,10 @@ public class EVCentral {
                 bus.publish(T_SESSIONS, driverId,
                     obj("type","AUTH","ts",System.currentTimeMillis(),
                         "driver",driverId,"cp",cpID,"ok",false,"reason","DRIVER_INVALIDO","src","CENTRAL"));
+                audit("REQ_START_FAIL", "DRV=" + driverId + " cp=" + cpID, "reason=DRIVER_INVALIDO");
                 return;
             }
+            
 
             // 2) Valida CP
             CPInfo info = cps.get(cpID);
@@ -953,8 +975,11 @@ public class EVCentral {
                 bus.publish(T_SESSIONS, driverId,
                     obj("type","AUTH","ts",System.currentTimeMillis(),
                         "driver",driverId,"cp",cpID,"ok",false,"reason","CP_DESCONOCIDO","src","CENTRAL"));
+                audit("REQ_START_FAIL", "DRV=" + driverId + " cp=" + cpID, "reason=CP_DESCONOCIDO");
                 return;
             }
+            
+
 
             // 3) Reservar y construir mensajes bajo lock; publicar fuera
             String sesId = null;
@@ -968,9 +993,11 @@ public class EVCentral {
                 } else if (info.parado) {
                     authMsg = obj("type","AUTH","ts",System.currentTimeMillis(),
                                 "driver",driverId,"cp",cpID,"ok",false,"reason","PARADO","src","CENTRAL");
+                    audit("REQ_START_FAIL", "DRV=" + driverId + " cp=" + cpID, "reason=PARADO");
                 } else if (info.ocupado) {
                     authMsg = obj("type","AUTH","ts",System.currentTimeMillis(),
                                 "driver",driverId,"cp",cpID,"ok",false,"reason","OCUPADO","src","CENTRAL");
+                    audit("REQ_START_FAIL", "DRV=" + driverId + " cp=" + cpID, "reason=OCUPADO");
                 } else {
                     sesId = "S-" + System.currentTimeMillis();
                     price = info.precio;
@@ -982,6 +1009,9 @@ public class EVCentral {
                     cpSesionesActivas.put(cpID, sesId);
 
                     try { dbOpenSession(sesId, cpID, driverId, price); } catch (Exception ignore) {}
+
+                    audit("REQ_START_OK", "DRV=" + driverId + " cp=" + cpID, "session=" + sesId + " price=" + price);
+
 
                     long now = System.currentTimeMillis();
                     authMsg   = obj("type","AUTH","ts",now,"driver",driverId,"cp",cpID,
@@ -1092,6 +1122,8 @@ public class EVCentral {
 
             try {
                 dbCloseSession(sesId, tsEnd, reason, kwh, eur);
+                audit("SESSION_END", "session=" + sesId + " cp=" + cpID, "reason=" + reason + " kwh=" + kwh + " eur=" + eur);
+
             } catch (Exception ignore) {}
 
         } catch (Exception e) {
@@ -1220,6 +1252,31 @@ public class EVCentral {
         } catch (Exception e) {
             System.err.println("[CENTRAL][DEC] Error descifrando mensaje ENC: " + e.getMessage());
             return null;
+        }
+    }
+
+        // ====================== AUDITORÍA ======================
+
+    private static void audit(String action, String actor, String detail) {
+        String ts = java.time.Instant.now().toString();
+        String line = ts + " | " + action + " | " + actor + " | " + detail;
+
+        // Siempre sacamos por consola también
+        System.out.println("[AUDIT] " + line);
+
+        if (auditPath == null) return;
+
+        synchronized (auditLock) {
+            try (BufferedWriter w = Files.newBufferedWriter(
+                    auditPath,
+                    StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.APPEND)) {
+                w.write(line);
+                w.newLine();
+            } catch (IOException e) {
+                System.err.println("[AUDIT] ERROR escribiendo: " + e.getMessage());
+            }
         }
     }
 

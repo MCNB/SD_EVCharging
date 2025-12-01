@@ -23,6 +23,17 @@ import common.bus.EventBus;
 import common.bus.NoBus;
 import common.bus.KafkaBus;
 
+import java.security.SecureRandom;
+import java.util.Base64;
+import java.util.Arrays;
+
+import javax.crypto.Cipher;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+
+import com.google.gson.JsonParser;
+
+
 
 public class EVCentral {
     static class CPInfo {
@@ -46,13 +57,27 @@ public class EVCentral {
         }
     }
 
+    private static class AuthResult {
+        final boolean ok;
+        final String key;
+        final String reason;
+
+        AuthResult(boolean ok, String key, String reason) {
+            this.ok = ok;
+            this.key = key;
+            this.reason = reason;
+        }
+    }
+
     static String DB_URL, DB_USER, DB_PASS;
 
     private final static Map<String, CPInfo> cps = new ConcurrentHashMap<>();
+    private static final JsonParser JSON = new JsonParser();
     private final Map<String, SesionInfo> sesiones = new ConcurrentHashMap<>();
     private final Map<String, String> cpSesionesActivas = new ConcurrentHashMap<>();
     private final java.util.Set<String> stopSolicitado = java.util.concurrent.ConcurrentHashMap.newKeySet(); //Para ver si el END viene de un STOP manual
     private final static java.util.Set<String> driversValidos = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final java.util.concurrent.ConcurrentMap<String,String> cpKeys = new java.util.concurrent.ConcurrentHashMap<>();
     private EventBus bus = new NoBus();
     private String T_TELEMETRY, T_SESSIONS, T_CMD;
     
@@ -207,15 +232,64 @@ public class EVCentral {
 
     private void atender(Socket s) {
         String cliente = s.getRemoteSocketAddress().toString();
+        String remoteIp = s.getInetAddress().getHostAddress();
         System.out.println("[CENTRAL] Conexión " + cliente);
 
         try (DataInputStream in = new DataInputStream(s.getInputStream());
              DataOutputStream out = new DataOutputStream(s.getOutputStream())) {
 
+            boolean authenticated = false;
+            String cpIdAutenticado = null;
+
             while (true) {
                 JsonObject msg = recv(in);
                 String type = msg.has("type") ? msg.get("type").getAsString() : null;
                 if (type == null) continue;
+
+                // --- FASE DE AUTENTICACIÓN ---
+                if (!authenticated) {
+                    if ("AUTH_CP".equals(type)) {
+                        String cpID   = msg.get("cp").getAsString();
+                        String secret = msg.get("secret").getAsString();
+
+                        if (cpID != null) {
+                            cpID = cpID.toUpperCase(java.util.Locale.ROOT);
+                        }
+
+                        AuthResult ar = autenticarCpEnBd(cpID, secret, remoteIp);
+                        if (ar.ok) {
+                            // Enviamos AUTH_OK con la clave simétrica
+                            send(out, obj("type","AUTH_OK",
+                                          "ts",System.currentTimeMillis(),
+                                          "cp",cpID,
+                                          "key",ar.key));
+                            authenticated = true;
+                            cpIdAutenticado = cpID;
+                            System.out.println("[CENTRAL] CP autenticado: " + cpID);
+                        } else {
+                            // Enviamos AUTH_ERR y cerramos conexión
+                            send(out, obj("type","AUTH_ERR",
+                                          "ts",System.currentTimeMillis(),
+                                          "cp",cpID,
+                                          "reason",ar.reason));
+                            System.out.println("[CENTRAL] AUTH_CP rechazada para " + cpID +
+                                               " reason=" + ar.reason);
+                            break;
+                        }
+                    } else {
+                        // Cualquier cosa que no sea AUTH_CP antes de autenticarse => error
+                        send(out, obj("type","AUTH_ERR",
+                                      "ts",System.currentTimeMillis(),
+                                      "cp","?",
+                                      "reason","MISSING_AUTH"));
+                        System.out.println("[CENTRAL] Recibido " + type +
+                                           " antes de AUTH_CP. Cerrando conexión " + cliente);
+                        break;
+                    }
+                    continue; // seguimos al siguiente frame
+                }
+
+                // --- A PARTIR DE AQUÍ EL CP YA ESTÁ AUTENTICADO ---
 
                 switch (type) {
                     // -------- Monitor: alta CP --------
@@ -223,6 +297,11 @@ public class EVCentral {
                         String cpID = msg.get("cp").getAsString();
                         String loc  = msg.get("loc").getAsString();
                         double price= msg.get("price").getAsDouble();
+
+                        // Normalizamos CP en mayúsculas
+                        if (cpID != null) {
+                            cpID = cpID.toUpperCase(java.util.Locale.ROOT);
+                        }
 
                         CPInfo info = cps.computeIfAbsent(cpID, _ -> new CPInfo());
                         synchronized (info) {
@@ -232,7 +311,7 @@ public class EVCentral {
                             info.estado = "ACTIVADO";
                             info.lastHb = System.currentTimeMillis();
                         }
-                         try { dbUpsertCP(cpID, loc, price); } catch (Exception ignore) {}
+                        try { dbUpsertCP(cpID, loc, price); } catch (Exception ignore) {}
                     }
                     // -------- Monitor: heartbeat --------
                     case "HB" -> {
@@ -252,7 +331,9 @@ public class EVCentral {
             }
         } catch (Exception e) {
             System.out.println("[CENTRAL] Conexión cerrada (" + cliente + "): " + e.getMessage());
-        } finally {}
+        } finally {
+            // aquí si quieres podrías loguear algo adicional al cierre
+        }
     }
 
     private String estadoVisible (CPInfo info) {
@@ -331,27 +412,27 @@ public class EVCentral {
     }
 
     private static void initDb (Properties config) {
-    DB_URL  = config.getProperty("db.url");
-    DB_USER = config.getProperty("db.user");
-    DB_PASS = config.getProperty("db.pass");
+        DB_URL  = config.getProperty("db.url");
+        DB_USER = config.getProperty("db.user");
+        DB_PASS = config.getProperty("db.pass");
 
-    // Smoke test de conexión (1 vez al inicio)
-    if (DB_URL != null && !DB_URL.isBlank()) {
-        try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
-             var st = cn.createStatement();
-             var rs = st.executeQuery("SELECT @@VERSION AS v")) {
-            if (rs.next()) {
-                System.out.println("[CENTRAL][DB] OK conectado. " + rs.getString("v"));
+        // Smoke test de conexión (1 vez al inicio)
+        if (DB_URL != null && !DB_URL.isBlank()) {
+            try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+                var st = cn.createStatement();
+                var rs = st.executeQuery("SELECT @@VERSION AS v")) {
+                if (rs.next()) {
+                    System.out.println("[CENTRAL][DB] OK conectado. " + rs.getString("v"));
+                }
+            } 
+            catch (Exception e) {
+                System.err.println("[CENTRAL][DB] ERROR conectando: " + e.getMessage());
             }
         } 
-        catch (Exception e) {
-            System.err.println("[CENTRAL][DB] ERROR conectando: " + e.getMessage());
+        else {
+            System.out.println("[CENTRAL][DB] Desactivada (sin db.url en config)");
         }
-    } 
-    else {
-        System.out.println("[CENTRAL][DB] Desactivada (sin db.url en config)");
     }
-}
 
     private void iniciarWatchdog () {
         Thread w = new Thread(() -> {
@@ -359,23 +440,16 @@ public class EVCentral {
                 long now = System.currentTimeMillis();
                 try {
                     for (Map.Entry<String, CPInfo> e : cps.entrySet()) {
-                        String cpID = e.getKey();
                         CPInfo info = e.getValue();
-                        String sID = cpSesionesActivas.get(cpID);
-
                         long lag = now - info.lastHb;
-                        if (lag > 3000) { // 3s sin latidos -> desconectado
-                            boolean cortar = false;
+
+                        // 3s sin latidos -> marcamos el CP como desconectado,
+                        // pero NO cortamos la sesión en el CP ni enviamos STOP_SUPPLY.
+                        if (lag > 3000) {
                             synchronized (info) {
                                 if (!"DESCONECTADO".equals(info.estado)) {
                                     info.estado = "DESCONECTADO";
-                                    cortar = info.ocupado; // si estaba suministrando, cortamos
                                 }
-                            }
-                            if (cortar && sID != null) {
-                                stopSolicitado.add(sID);
-                                bus.publish(T_CMD, cpID, obj("type","CMD","src","CENTRAL","ts",System.currentTimeMillis(),
-                             "cmd","STOP_SUPPLY","cp",cpID));
                             }
                         }
                     }
@@ -387,7 +461,7 @@ public class EVCentral {
         }, "watchdog-central");
         w.setDaemon(true);
         w.start();
-}
+    }
 
     private void iniciarHttpStatus (int httpPort) {
         try {
@@ -579,6 +653,55 @@ public class EVCentral {
         }
     }
     
+    private AuthResult autenticarCpEnBd(String cpId, String secret, String remoteIp) {
+        // Si no hay BD configurada, aceptamos todo y solo generamos la clave
+        if (DB_URL == null || DB_URL.isBlank()) {
+            String key = getOrCreateCpKey(cpId);
+            System.out.println("[CENTRAL][AUTH_CP] WARNING: sin DB_URL, aceptando CP=" + cpId +
+                               " ip=" + remoteIp);
+            return new AuthResult(true, key, null);
+        }
+
+        try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+             var ps = cn.prepareStatement(
+                     "SELECT secret, status FROM EV_CP_REGISTRY WHERE cp_id = ?")) {
+
+            ps.setString(1, cpId);
+            try (var rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    System.out.println("[CENTRAL][AUTH_CP] FAIL cp=" + cpId +
+                                       " ip=" + remoteIp + " reason=NOT_REGISTERED");
+                    return new AuthResult(false, null, "NOT_REGISTERED");
+                }
+
+                String dbSecret = rs.getString("secret");
+                String status   = rs.getString("status");
+
+                if (!"ACTIVO".equalsIgnoreCase(status)) {
+                    System.out.println("[CENTRAL][AUTH_CP] FAIL cp=" + cpId +
+                                       " ip=" + remoteIp + " reason=NOT_ACTIVE(" + status + ")");
+                    return new AuthResult(false, null, "NOT_ACTIVE");
+                }
+
+                if (!dbSecret.equals(secret)) {
+                    System.out.println("[CENTRAL][AUTH_CP] FAIL cp=" + cpId +
+                                       " ip=" + remoteIp + " reason=BAD_SECRET");
+                    return new AuthResult(false, null, "BAD_SECRET");
+                }
+            }
+
+            String key = getOrCreateCpKey(cpId);
+            System.out.println("[CENTRAL][AUTH_CP] OK cp=" + cpId + " ip=" + remoteIp +
+                               " key=" + key);
+            return new AuthResult(true, key, null);
+
+        } catch (Exception e) {
+            System.err.println("[CENTRAL][AUTH_CP] ERROR cp=" + cpId + " ip=" + remoteIp +
+                               " msg=" + e.getMessage());
+            return new AuthResult(false, null, "DB_ERROR");
+        }
+    }
+
     private static void dbLoadDrivers() {
         if (DB_URL==null || DB_URL.isBlank()) return;
         try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
@@ -686,24 +809,36 @@ public class EVCentral {
     }
     
     private String pauseCp(String cpID){
-    applyPauseLocal(cpID);
-    markStopRequested(cpID);
-    bus.publish(T_CMD, cpID, obj("type","CMD","src","CENTRAL","ts",System.currentTimeMillis(),
-                                 "cmd","STOP_SUPPLY","cp",cpID));
-    return "ACK PAUSE " + cpID + " (STOP_SUPPLY publicado)";
-}
+        applyPauseLocal(cpID);
+        markStopRequested(cpID);
+
+        com.google.gson.JsonObject inner = obj("type","CMD","src","CENTRAL","ts",System.currentTimeMillis(),
+                                               "cmd","STOP_SUPPLY","cp",cpID);
+        com.google.gson.JsonObject enc = encryptForCp(cpID, inner);
+        bus.publish(T_CMD, cpID, enc);
+
+        return "ACK PAUSE " + cpID + " (STOP_SUPPLY publicado)";
+    }
 
     private String resumeCp(String cpID){
         applyResumeLocal(cpID);
-        bus.publish(T_CMD, cpID, obj("type","CMD","src","CENTRAL","ts",System.currentTimeMillis(),
-                                    "cmd","RESUME","cp",cpID));
+
+        com.google.gson.JsonObject inner = obj("type","CMD","src","CENTRAL","ts",System.currentTimeMillis(),
+                                               "cmd","RESUME","cp",cpID);
+        com.google.gson.JsonObject enc = encryptForCp(cpID, inner);
+        bus.publish(T_CMD, cpID, enc);
+
         return "ACK RESUME " + cpID + " (RESUME publicado)";
     }
 
     private String stopCp(String cpID){
         markStopRequested(cpID);
-        bus.publish(T_CMD, cpID, obj("type","CMD","src","CENTRAL","ts",System.currentTimeMillis(),
-                                    "cmd","STOP_SUPPLY","cp",cpID));
+
+        com.google.gson.JsonObject inner = obj("type","CMD","src","CENTRAL","ts",System.currentTimeMillis(),
+                                               "cmd","STOP_SUPPLY","cp",cpID);
+        com.google.gson.JsonObject enc = encryptForCp(cpID, inner);
+        bus.publish(T_CMD, cpID, enc);
+
         return "ACK STOP " + cpID + " (STOP_SUPPLY publicado)";
     }
 
@@ -749,9 +884,10 @@ public class EVCentral {
                                     obj("type","STOP_ACK","ts",System.currentTimeMillis(),
                                         "ok",true,"session",session,"cp",cpID,"src","CENTRAL"));
                             }
-                            bus.publish(T_CMD, cpID,
-                                obj("type","CMD","ts",System.currentTimeMillis(),"src","CENTRAL",
-                                    "cmd","STOP_SUPPLY","session",session,"cp",cpID));
+                            com.google.gson.JsonObject innerCmd = obj("type","CMD","ts",System.currentTimeMillis(),"src","CENTRAL",
+                                          "cmd","STOP_SUPPLY","session",session,"cp",cpID);
+                            com.google.gson.JsonObject enc = encryptForCp(cpID, innerCmd);
+                            bus.publish(T_CMD, cpID, enc);
                         } else {
                             if (m.has("driver")) {
                                 String driverId = m.get("driver").getAsString();
@@ -770,9 +906,10 @@ public class EVCentral {
                         if (cpID != null) cpID = cpID.toUpperCase(java.util.Locale.ROOT);
                         if (session == null && cpID != null) session = cpSesionesActivas.get(cpID);
                         if (session != null && cpID != null) {
-                            bus.publish(T_CMD, cpID,
-                                obj("type","CMD","ts",System.currentTimeMillis(),"src","CENTRAL",
-                                    "cmd","PAUSE_SUPPLY","session",session,"cp",cpID));
+                            com.google.gson.JsonObject innerCmd = obj("type","CMD","ts",System.currentTimeMillis(),"src","CENTRAL",
+                                          "cmd","PAUSE_SUPPLY","session",session,"cp",cpID);
+                            com.google.gson.JsonObject enc = encryptForCp(cpID, innerCmd);
+                            bus.publish(T_CMD, cpID, enc);
                         }
                         return;
                     }
@@ -784,9 +921,10 @@ public class EVCentral {
                         if (cpID != null) cpID = cpID.toUpperCase(java.util.Locale.ROOT);
                         if (session == null && cpID != null) session = cpSesionesActivas.get(cpID);
                         if (session != null && cpID != null) {
-                            bus.publish(T_CMD, cpID,
-                                obj("type","CMD","ts",System.currentTimeMillis(),"src","CENTRAL",
-                                    "cmd","RESUME_SUPPLY","session",session,"cp",cpID));
+                            com.google.gson.JsonObject innerCmd = obj("type","CMD","ts",System.currentTimeMillis(),"src","CENTRAL",
+                                          "cmd","RESUME_SUPPLY","session",session,"cp",cpID);
+                            com.google.gson.JsonObject enc = encryptForCp(cpID, innerCmd);
+                            bus.publish(T_CMD, cpID, enc);
                         }
                         return;
                     }
@@ -860,7 +998,9 @@ public class EVCentral {
             // 4) Publicaciones FUERA del lock
             if (authMsg != null) bus.publish(T_SESSIONS, driverId, authMsg);
             if (startCmd != null && sessStart != null) {
-                bus.publish(T_CMD,      cpID,  startCmd);
+                com.google.gson.JsonObject encStart = encryptForCp(cpID, startCmd);
+                bus.publish(T_CMD,      cpID,  encStart);
+                // T_SESSIONS hacia el driver sigue en claro.
                 bus.publish(T_SESSIONS, sesId, sessStart);
             }
 
@@ -871,19 +1011,36 @@ public class EVCentral {
 
     private void onKafkaTelemetry(com.google.gson.JsonObject m) {
         try {
+            // --- Soportar mensajes cifrados desde el CP (envoltorio ENC) ---
+            if (m.has("type") && "ENC".equals(m.get("type").getAsString())) {
+                com.google.gson.JsonObject inner = decryptFromCp(m);
+                if (inner == null) return;      // no se ha podido descifrar
+                m = inner;                      // seguimos trabajando con el JSON interno
+            }
+
+            // --- A partir de aquí es el mensaje TEL "normal" ---
             if (!m.has("type") || !"TEL".equals(m.get("type").getAsString())) return;
-            String ses = m.get("session").getAsString();
-            String cpID  = m.get("cp").getAsString().toUpperCase(java.util.Locale.ROOT);
+
+            String ses  = m.get("session").getAsString();
+            String cpID = m.get("cp").getAsString()
+                            .toUpperCase(java.util.Locale.ROOT);
 
             double kwh = m.get("kwh").getAsDouble();
             double eur = m.get("eur").getAsDouble();
 
             var sInf = sesiones.get(ses);
-            if (sInf != null) { sInf.kWhAccumulado = kwh; sInf.eurAccumulado = eur; }
+            if (sInf != null) {
+                sInf.kWhAccumulado = kwh;
+                sInf.eurAccumulado = eur;
+            }
 
             var info = cps.get(cpID);
-            if (info != null) synchronized (info) {
-                if (!"SUMINISTRANDO".equals(info.estado)) info.estado = "SUMINISTRANDO";
+            if (info != null) {
+                synchronized (info) {
+                    if (!"SUMINISTRANDO".equals(info.estado)) {
+                        info.estado = "SUMINISTRANDO";
+                    }
+                }
             }
 
         } catch (Exception e) {
@@ -893,37 +1050,55 @@ public class EVCentral {
 
     private void onKafkaSessions(com.google.gson.JsonObject m) {
         try {
+            // --- Soportar mensajes cifrados desde el CP (envoltorio ENC) ---
+            if (m.has("type") && "ENC".equals(m.get("type").getAsString())) {
+                com.google.gson.JsonObject inner = decryptFromCp(m);
+                if (inner == null) return;      // no se ha podido descifrar
+                m = inner;                      // seguimos con el JSON interno
+            }
+
+            // --- A partir de aquí es el SESSION_END "normal" ---
             if (!m.has("type")) return;
             if (!"SESSION_END".equals(m.get("type").getAsString())) return;
 
             String sesId = m.get("session").getAsString();
             String cpID  = m.get("cp").getAsString();
-            if (cpID != null) cpID = cpID.toUpperCase(java.util.Locale.ROOT);
+            if (cpID != null) {
+                cpID = cpID.toUpperCase(java.util.Locale.ROOT);
+            }
 
-            long tsEnd = m.has("ts") ? m.get("ts").getAsLong() : System.currentTimeMillis();
-            double kwh   = m.has("kwh") ? m.get("kwh").getAsDouble() : 0.0;
-            double eur   = m.has("eur") ? m.get("eur").getAsDouble() : 0.0;
-            String reason= m.has("reason") ? m.get("reason").getAsString() : "OK";
+            long tsEnd   = m.has("ts")     ? m.get("ts").getAsLong()      : System.currentTimeMillis();
+            double kwh   = m.has("kwh")    ? m.get("kwh").getAsDouble()   : 0.0;
+            double eur   = m.has("eur")    ? m.get("eur").getAsDouble()   : 0.0;
+            String reason= m.has("reason") ? m.get("reason").getAsString(): "OK";
 
             boolean eraSTOP = stopSolicitado.remove(sesId);
-            if (eraSTOP && "OK".equals(reason)) reason = "STOP_REQUESTED";
+            if (eraSTOP && "OK".equals(reason)) {
+                reason = "STOP_REQUESTED";
+            }
 
             sesiones.remove(sesId);
             cpSesionesActivas.remove(cpID, sesId);
 
             var info = cps.get(cpID);
-            if (info != null) synchronized (info) {
-                info.ocupado = false;
-                if (!info.parado && !"AVERIADO".equals(info.estado)) info.estado = "ACTIVADO";
+            if (info != null) {
+                synchronized (info) {
+                    info.ocupado = false;
+                    if (!info.parado && !"AVERIADO".equals(info.estado)) {
+                        info.estado = "ACTIVADO";
+                    }
+                }
             }
 
-            try { dbCloseSession(sesId, tsEnd,reason, kwh, eur); } catch (Exception ignore) {}
+            try {
+                dbCloseSession(sesId, tsEnd, reason, kwh, eur);
+            } catch (Exception ignore) {}
 
         } catch (Exception e) {
             System.err.println("[CENTRAL][KAFKA] SESSION_END: " + e.getMessage());
         }
     }
-   
+
     private void applyPauseLocal(String cpID){
         CPInfo info = cps.get(cpID);
         if (info == null) return;
@@ -942,6 +1117,110 @@ public class EVCentral {
     private void markStopRequested(String cpID){
         String sId = cpSesionesActivas.get(cpID);
         if (sId != null) stopSolicitado.add(sId);
+    }
+
+    private String getOrCreateCpKey(String cpId) {
+        return cpKeys.computeIfAbsent(cpId, id -> generarClaveSimetrica());
+    }
+
+    private String generarClaveSimetrica() {
+        byte[] buf = new byte[32]; // 256 bits
+        new java.security.SecureRandom().nextBytes(buf);
+        return java.util.Base64.getEncoder().encodeToString(buf);
+    }
+
+        // ---------- Cifrado simétrico AES/GCM para CPs ----------
+
+    private static String aesEncrypt(String plainText, String keyB64) throws Exception {
+        byte[] keyBytes = Base64.getDecoder().decode(keyB64);
+        SecretKeySpec key = new SecretKeySpec(keyBytes, "AES");
+
+        // IV de 96 bits recomendado para GCM
+        byte[] iv = new byte[12];
+        new SecureRandom().nextBytes(iv);
+
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        GCMParameterSpec spec = new GCMParameterSpec(128, iv);
+        cipher.init(Cipher.ENCRYPT_MODE, key, spec);
+        byte[] cipherText = cipher.doFinal(plainText.getBytes(StandardCharsets.UTF_8));
+
+        // empaquetamos IV + cipherText y lo codificamos en Base64
+        byte[] out = new byte[iv.length + cipherText.length];
+        System.arraycopy(iv, 0, out, 0, iv.length);
+        System.arraycopy(cipherText, 0, out, iv.length, cipherText.length);
+
+        return Base64.getEncoder().encodeToString(out);
+    }
+
+    private static String aesDecrypt(String cipherB64, String keyB64) throws Exception {
+        byte[] all = Base64.getDecoder().decode(cipherB64);
+        if (all.length < 13) throw new IllegalArgumentException("cipher too short");
+
+        byte[] iv          = Arrays.copyOfRange(all, 0, 12);
+        byte[] cipherBytes = Arrays.copyOfRange(all, 12, all.length);
+
+        byte[] keyBytes = Base64.getDecoder().decode(keyB64);
+        SecretKeySpec key = new SecretKeySpec(keyBytes, "AES");
+
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        GCMParameterSpec spec = new GCMParameterSpec(128, iv);
+        cipher.init(Cipher.DECRYPT_MODE, key, spec);
+
+        byte[] plainBytes = cipher.doFinal(cipherBytes);
+        return new String(plainBytes, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Envuelve un mensaje "interno" (CMD, etc.) para un CP en un sobre cifrado:
+     * {
+     *   "type":"ENC","src":"CENTRAL","cp":cpID,"ts":...,"payload":"base64(iv+cipher)"
+     * }
+     */
+    private com.google.gson.JsonObject encryptForCp(String cpID, com.google.gson.JsonObject inner) {
+        String key = cpKeys.get(cpID);
+        if (key == null) {
+            System.err.println("[CENTRAL][ENC] No hay clave para CP " + cpID + ". Enviando sin cifrar.");
+            return inner; // fallback: protocolo antiguo
+        }
+        try {
+            String cipherB64 = aesEncrypt(inner.toString(), key);
+            com.google.gson.JsonObject env = obj(
+                    "type","ENC",
+                    "src","CENTRAL",
+                    "ts",System.currentTimeMillis(),
+                    "cp",cpID,
+                    "payload",cipherB64
+            );
+            return env;
+        } catch (Exception e) {
+            System.err.println("[CENTRAL][ENC] Error cifrando para CP " + cpID + ": " + e.getMessage());
+            return inner; // fallback
+        }
+    }
+
+    /**
+     * Descifra un mensaje "ENC" procedente de un CP.
+     * Devuelve el JSON interno (CMD/TEL/SESSION_END) o null si algo falla.
+     */
+    private com.google.gson.JsonObject decryptFromCp(com.google.gson.JsonObject m) {
+        try {
+            if (!m.has("cp") || !m.has("payload")) {
+                System.err.println("[CENTRAL][DEC] Mensaje ENC sin cp/payload");
+                return null;
+            }
+            String cpID = m.get("cp").getAsString().toUpperCase(java.util.Locale.ROOT);
+            String key  = cpKeys.get(cpID);
+            if (key == null) {
+                System.err.println("[CENTRAL][DEC] No hay clave para CP " + cpID);
+                return null;
+            }
+            String cipherB64 = m.get("payload").getAsString();
+            String plainJson = aesDecrypt(cipherB64, key);
+            return JSON.parse(plainJson).getAsJsonObject();
+        } catch (Exception e) {
+            System.err.println("[CENTRAL][DEC] Error descifrando mensaje ENC: " + e.getMessage());
+            return null;
+        }
     }
 
 }

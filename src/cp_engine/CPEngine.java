@@ -6,14 +6,20 @@ import common.bus.KafkaBus;
 
 import java.io.*;
 import java.net.ServerSocket;
-import java.net.Socket;
 import java.nio.file.*;
+import java.security.SecureRandom;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.Locale;
 import java.util.Properties;
+
+import javax.crypto.Cipher;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
 
 import com.sun.net.httpserver.HttpServer;
 import com.sun.net.httpserver.HttpExchange;
 import java.nio.charset.StandardCharsets;
-
 
 import static common.net.Wire.*;
 
@@ -32,6 +38,12 @@ public class CPEngine {
     private static int parseIntOr(String s, int def){ try{ return Integer.parseInt(s);}catch(Exception e){return def;} }
     private static double parseDoubleOr(String s, double def){ try{ return Double.parseDouble(s);}catch(Exception e){return def;} }
 
+    private static final com.google.gson.JsonParser JSON = new com.google.gson.JsonParser();
+
+    // --- NUEVO: cpId y clave simétrica compartida con CENTRAL ---
+    private static String cpId;
+    private static String cpKeyB64;
+
     public static void main(String[] args) throws Exception {
 
         String rutaConfig = "config/engine.config";
@@ -40,36 +52,51 @@ public class CPEngine {
         try (InputStream in = Files.newInputStream(Path.of(rutaConfig))) { cfg.load(in); }
 
         int puertoHealth = parseIntOr(cfg.getProperty("engine.healthPort","6100"),6100);
-        String cpId      = cfg.getProperty("engine.cpId","CP-001");
+        String cpIdCfg   = cfg.getProperty("engine.cpId","CP-001");
+        cpId             = cpIdCfg.toUpperCase(Locale.ROOT);
+
         potenciaKW       = parseDoubleOr(cfg.getProperty("engine.potenciaKW","7.2"),7.2);
         duracionDemoSec  = parseIntOr(cfg.getProperty("engine.durationSec","15"),15);
         boolean consolePanel = Boolean.parseBoolean(cfg.getProperty("engine.consolepanel","false"));
-        int httpPort = parseIntOr(cfg.getProperty("engine.httpPort","8081"),8081);
+        int httpPort     = parseIntOr(cfg.getProperty("engine.httpPort","8081"),8081);
 
         final String T_CMD       = cfg.getProperty("kafka.topic.cmd","ev.cmd.v1");
         final String T_TELEMETRY = cfg.getProperty("kafka.topic.telemetry","ev.telemetry.v1");
         final String T_SESSIONS  = cfg.getProperty("kafka.topic.sessions","ev.sessions.v1");
+
+        String keyFile = cfg.getProperty("engine.key.file", "config/cp.key");
+        cpKeyB64 = Files.readString(Path.of(keyFile), StandardCharsets.UTF_8).trim();
+        System.out.println("[ENGINE] cpId=" + cpId + " Clave simétrica leída de " + keyFile);
 
         EventBus bus = KafkaBus.from(cfg);
 
         cpCfgId = cpId;
 
         iniciarHealthServer(puertoHealth);
-        if (consolePanel) iniciarConsola(); 
+        if (consolePanel) iniciarConsola();
         iniciarHttpPanel(httpPort);
 
         System.out.println("[ENG] cp=" + cpId + " Kafka topics: CMD=" + T_CMD + " TEL=" + T_TELEMETRY + " SESS=" + T_SESSIONS);
 
-        // Suscribimos comandos para mi CP
-        bus.subscribe(T_CMD, m -> {
+        // Suscribimos comandos para mi CP (con soporte ENC)
+        bus.subscribe(T_CMD, m0 -> {
             try {
+                JsonObject m = m0;
+
+                // Si viene en sobre cifrado ENC, lo desciframos
+                if (m.has("type") && "ENC".equals(m.get("type").getAsString())) {
+                    JsonObject inner = decryptFromCentral(m);
+                    if (inner == null) return;
+                    m = inner;
+                }
+
                 if (!m.has("type") || !"CMD".equals(m.get("type").getAsString())) return;
                 if (!m.has("cp") || !cpId.equals(m.get("cp").getAsString())) return;
 
                 String cmd = m.has("cmd") ? m.get("cmd").getAsString() : "";
                 switch (cmd) {
                     case "START_SUPPLY" -> {
-                        String ses = m.get("session").getAsString();
+                        String ses   = m.get("session").getAsString();
                         double price = m.has("price") ? m.get("price").getAsDouble() : 0.0;
                         startSupply(bus, T_TELEMETRY, T_SESSIONS, cpId, ses, price);
                     }
@@ -86,6 +113,7 @@ public class CPEngine {
                 System.err.println("[ENG] onCmd ERROR: " + e.getMessage());
             }
         });
+
         // El hilo principal queda vivo
         Thread.currentThread().join();
     }
@@ -101,10 +129,10 @@ public class CPEngine {
                 enMarcha     = false;
                 enchufado    = false; // ← exige PLUG nuevo SIEMPRE
 
-                // ACK temprano de espera
-                bus.publish(T_SESSIONS, thisSession,
-                    obj("type","WAITING_PLUG","ts",System.currentTimeMillis(),
-                        "session",thisSession,"cp",cp,"src","ENGINE"));
+                // ACK temprano de espera (ahora cifrado hacia CENTRAL)
+                JsonObject waiting = obj("type","WAITING_PLUG","ts",System.currentTimeMillis(),
+                                         "session",thisSession,"cp",cp,"src","ENGINE");
+                bus.publish(T_SESSIONS, thisSession, encryptForCentral(waiting));
 
                 System.out.println("[ENG] Esperando PLUG...");
                 while (!enchufado && thisSession.equals(sesionActiva)) {
@@ -113,17 +141,17 @@ public class CPEngine {
 
                 // Si nos “pisan” la sesión, CIERRA explícitamente
                 if (!thisSession.equals(sesionActiva)) {
-                    bus.publish(T_SESSIONS, thisSession,
-                        obj("type","SESSION_END","ts",System.currentTimeMillis(),
-                            "session",thisSession,"cp",cp,"kwh",0.0,"eur",0.0,
-                            "reason","ABORTED_SUPERSEDED","src","ENGINE"));
+                    JsonObject aborted = obj("type","SESSION_END","ts",System.currentTimeMillis(),
+                                             "session",thisSession,"cp",cp,"kwh",0.0,"eur",0.0,
+                                             "reason","ABORTED_SUPERSEDED","src","ENGINE");
+                    bus.publish(T_SESSIONS, thisSession, encryptForCentral(aborted));
                     return;
                 }
 
-                // (Opcional) CHARGING_STARTED
-                bus.publish(T_SESSIONS, thisSession,
-                    obj("type","CHARGING_STARTED","ts",System.currentTimeMillis(),
-                        "session",thisSession,"cp",cp,"src","ENGINE"));
+                // (Opcional) CHARGING_STARTED (también cifrado)
+                JsonObject started = obj("type","CHARGING_STARTED","ts",System.currentTimeMillis(),
+                                         "session",thisSession,"cp",cp,"src","ENGINE");
+                bus.publish(T_SESSIONS, thisSession, encryptForCentral(started));
 
                 enMarcha = true;
 
@@ -137,17 +165,17 @@ public class CPEngine {
                     kWh += potenciaKW / 3600.0;
                     eur  = kWh * precio;
 
-                    bus.publish(T_TELEMETRY, thisSession,
-                        obj("type","TEL","ts",t,"session",thisSession,"cp",cp,
-                            "power",potenciaKW,"kwh",kWh,"eur",eur,"src","ENGINE"));
+                    JsonObject tel = obj("type","TEL","ts",t,"session",thisSession,"cp",cp,
+                                         "power",potenciaKW,"kwh",kWh,"eur",eur,"src","ENGINE");
+                    bus.publish(T_TELEMETRY, thisSession, encryptForCentral(tel));
 
                     if (duracionDemoSec > 0 && ++seg >= duracionDemoSec) enMarcha = false;
                 }
 
-                bus.publish(T_SESSIONS, thisSession,
-                    obj("type","SESSION_END","ts",System.currentTimeMillis(),
-                        "session",thisSession,"cp",cp,"kwh",kWh,"eur",eur,
-                        "reason","OK","src","ENGINE"));
+                JsonObject end = obj("type","SESSION_END","ts",System.currentTimeMillis(),
+                                     "session",thisSession,"cp",cp,"kwh",kWh,"eur",eur,
+                                     "reason","OK","src","ENGINE");
+                bus.publish(T_SESSIONS, thisSession, encryptForCentral(end));
 
             } catch (Exception e) {
                 System.err.println("[ENG] startSupply ERR: " + e.getMessage());
@@ -221,7 +249,7 @@ public class CPEngine {
         }
     }
 
-    private static void handlePanel(com.sun.net.httpserver.HttpExchange ex) {
+    private static void handlePanel(HttpExchange ex) {
         try {
             String cp  = (cpIDActual != null) ? cpIDActual : (cpCfgId != null ? cpCfgId : "");
             String okPill = healthy ? "<span class='pill ok'>OK</span>" : "<span class='pill ko'>KO</span>";
@@ -273,7 +301,7 @@ public class CPEngine {
         }
     }
 
-    private static void handleCmd(com.sun.net.httpserver.HttpExchange ex) {
+    private static void handleCmd(HttpExchange ex) {
         try {
             String q = ex.getRequestURI().getQuery();
             String op = null;
@@ -306,4 +334,84 @@ public class CPEngine {
         }
     }
 
+    // ---------- AES/GCM + envoltorios ENC ----------
+
+    private static String aesEncrypt(String plainText, String keyB64) throws Exception {
+        byte[] keyBytes = Base64.getDecoder().decode(keyB64);
+        SecretKeySpec key = new SecretKeySpec(keyBytes, "AES");
+
+        // IV de 96 bits recomendado para GCM
+        byte[] iv = new byte[12];
+        new SecureRandom().nextBytes(iv);
+
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        GCMParameterSpec spec = new GCMParameterSpec(128, iv);
+        cipher.init(Cipher.ENCRYPT_MODE, key, spec);
+        byte[] cipherText = cipher.doFinal(plainText.getBytes(StandardCharsets.UTF_8));
+
+        // empaquetamos IV + cipherText y lo codificamos en Base64
+        byte[] out = new byte[iv.length + cipherText.length];
+        System.arraycopy(iv, 0, out, 0, iv.length);
+        System.arraycopy(cipherText, 0, out, iv.length, cipherText.length);
+
+        return Base64.getEncoder().encodeToString(out);
+    }
+
+    private static String aesDecrypt(String cipherB64, String keyB64) throws Exception {
+        byte[] all = Base64.getDecoder().decode(cipherB64);
+        if (all.length < 13) throw new IllegalArgumentException("cipher too short");
+
+        byte[] iv          = Arrays.copyOfRange(all, 0, 12);
+        byte[] cipherBytes = Arrays.copyOfRange(all, 12, all.length);
+
+        byte[] keyBytes = Base64.getDecoder().decode(keyB64);
+        SecretKeySpec key = new SecretKeySpec(keyBytes, "AES");
+
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        GCMParameterSpec spec = new GCMParameterSpec(128, iv);
+        cipher.init(Cipher.DECRYPT_MODE, key, spec);
+
+        byte[] plainBytes = cipher.doFinal(cipherBytes);
+        return new String(plainBytes, StandardCharsets.UTF_8);
+    }
+
+    private static JsonObject encryptForCentral(JsonObject inner) {
+        try {
+            if (cpKeyB64 == null || cpKeyB64.isBlank()) {
+                System.err.println("[ENGINE][ENC] No hay clave, enviando sin cifrar");
+                return inner;
+            }
+            String cipherB64 = aesEncrypt(inner.toString(), cpKeyB64);
+            JsonObject env = obj(
+                    "type","ENC",
+                    "src","CP",
+                    "ts",System.currentTimeMillis(),
+                    "cp",cpId,
+                    "payload",cipherB64
+            );
+            return env;
+        } catch (Exception e) {
+            System.err.println("[ENGINE][ENC] Error cifrando hacia CENTRAL: " + e.getMessage());
+            return inner; // fallback sin cifrar
+        }
+    }
+
+    private static JsonObject decryptFromCentral(JsonObject m) {
+        try {
+            if (cpKeyB64 == null || cpKeyB64.isBlank()) {
+                System.err.println("[ENGINE][DEC] No hay clave, imposible descifrar");
+                return null;
+            }
+            if (!m.has("payload")) {
+                System.err.println("[ENGINE][DEC] Mensaje ENC sin payload");
+                return null;
+            }
+            String cipherB64 = m.get("payload").getAsString();
+            String plainJson = aesDecrypt(cipherB64, cpKeyB64);
+            return JSON.parse(plainJson).getAsJsonObject();
+        } catch (Exception e) {
+            System.err.println("[ENGINE][DEC] Error descifrando mensaje ENC: " + e.getMessage());
+            return null;
+        }
+    }
 }

@@ -44,7 +44,6 @@ public class EVCentral {
         volatile boolean ocupado = false;
         volatile boolean parado = false;
     }
-
     static class SesionInfo {
         final String sesionID, cpID, driverID;
         final long startUTC;
@@ -56,8 +55,7 @@ public class EVCentral {
             startUTC = System.currentTimeMillis();
         }
     }
-
-    private static class AuthResult {
+    static class AuthResult {
         final boolean ok;
         final String key;
         final String reason;
@@ -68,97 +66,37 @@ public class EVCentral {
             this.reason = reason;
         }
     }
-
+    static class WeatherInfo {
+        volatile String loc;
+        volatile double tempC;
+        volatile boolean alert;   // true si está por debajo de 0 ºC
+        volatile long lastUpdate; // millis
+    }
+    
+    //DB
     static String DB_URL, DB_USER, DB_PASS;
 
+    //Mapas y colecciones
     private final static Map<String, CPInfo> cps = new ConcurrentHashMap<>();
-    private static final JsonParser JSON = new JsonParser();
     private final Map<String, SesionInfo> sesiones = new ConcurrentHashMap<>();
     private final Map<String, String> cpSesionesActivas = new ConcurrentHashMap<>();
     private final java.util.Set<String> stopSolicitado = java.util.concurrent.ConcurrentHashMap.newKeySet(); //Para ver si el END viene de un STOP manual
     private final static java.util.Set<String> driversValidos = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final java.util.concurrent.ConcurrentMap<String,String> cpKeys = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, WeatherInfo> cpWeather = new java.util.concurrent.ConcurrentHashMap<>();
+
+    //Kafka
     private EventBus bus = new NoBus();
     private String T_TELEMETRY, T_SESSIONS, T_CMD;
 
+    //Auditoría
     private static Path auditPath;
     private static final Object auditLock = new Object();
+
+    //Parse JSON
+    private static final JsonParser JSON = new JsonParser();
     
-
-    //Para evitar trolleos en el fichero de configuración
-    //y se lea algo que no sea un número, evitando el NumberFormatException
-    private static int parseIntOr (String s, int def) {
-        try {
-            return Integer.parseInt(s);
-        }
-        catch (Exception e) {
-            return def;
-        }
-    }
-
-    private void dbOpenSession (String sID, String cpID, String driverID, double precio){
-        try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
-             var st = cn.prepareCall("{call dbo.spOpenSession(?,?,?,?,?)}")) {
-            st.setString(1, sID);
-            st.setString(2, cpID);
-            st.setString(3, driverID);
-            st.setBigDecimal(4, java.math.BigDecimal.valueOf(precio).setScale(4, java.math.RoundingMode.HALF_UP));
-            st.setTimestamp(5, java.sql.Timestamp.from(java.time.Instant.now()),
-                    java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC")));
-            st.execute();
-        } catch (Exception e) { System.out.println("[CENTRAL][DB] spOpenSession("+sID+","+cpID+") ERROR: " + e.getMessage()); }
-    }
-
-    private void dbCloseSession (String sID, long tsMillis, String motivo, double kwh, double eur){
-        if (DB_URL==null || DB_URL.isBlank()) return;
-        try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
-            var st = cn.prepareCall("{call dbo.spCloseSession(?,?,?,?,?)}")) {
-            st.setString(1, sID);
-            st.setTimestamp(2, new java.sql.Timestamp(tsMillis),
-                    java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC")));
-            st.setString(3, motivo);
-            st.setBigDecimal(4, java.math.BigDecimal.valueOf(kwh).setScale(6, java.math.RoundingMode.HALF_UP));
-            st.setBigDecimal(5, java.math.BigDecimal.valueOf(eur).setScale(4, java.math.RoundingMode.HALF_UP));
-            st.execute();
-        } catch (Exception e) {
-            System.out.println("[CENTRAL][DB] spCloseSession("+sID+") ERROR: " + e.getMessage());
-        }
-    }
-
-    private void dbRecoverOpenSessions() {
-        if (DB_URL==null || DB_URL.isBlank()) return;
-        try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
-            var ps = cn.prepareStatement("""
-                SELECT s.session_id, s.cp_id, s.driver_id, s.price_eur_kwh, s.t_start
-                FROM dbo.[Session] s
-                WHERE s.t_end IS NULL
-            """);
-            var rs = ps.executeQuery()) {
-
-            int n=0;
-            while (rs.next()) {
-                String sesId  = rs.getString(1);
-                String cpID   = rs.getString(2).toUpperCase(java.util.Locale.ROOT);
-                String driver = rs.getString(3);
-
-                // reconstruye in-memory
-                var info = cps.computeIfAbsent(cpID, _ -> new CPInfo());
-                synchronized (info) {
-                    info.cpID   = cpID;
-                    info.estado = "ESPERANDO_PLUG"; // o "DESCONECTADO" si no hay HB aún
-                    info.ocupado= true;
-                }
-                var sInf = new SesionInfo(sesId, cpID, driver);
-                sesiones.put(sesId, sInf);
-                cpSesionesActivas.put(cpID, sesId);
-                n++;
-            }
-            System.out.println("[CENTRAL][RECOVERY] Sesiones abiertas rehidratadas: " + n);
-        } catch (Exception e) {
-            System.err.println("[CENTRAL][RECOVERY] ERROR: " + e.getMessage());
-        }
-    }
-
+    
     public static void main (String[] args) throws Exception {
         String rutaConfig = "config/central.config";
 
@@ -244,6 +182,138 @@ public class EVCentral {
         }
     }
 
+    //Para evitar trolleos en el fichero de configuración
+    private static int parseIntOr (String s, int def) {
+        try {
+            return Integer.parseInt(s);
+        }
+        catch (Exception e) {
+            return def;
+        }
+    }
+
+    // ============================================================
+    // Inicio
+    // ============================================================
+    private static void initDb (Properties config) {
+        DB_URL  = config.getProperty("db.url");
+        DB_USER = config.getProperty("db.user");
+        DB_PASS = config.getProperty("db.pass");
+
+        // Smoke test de conexión (1 vez al inicio)
+        if (DB_URL != null && !DB_URL.isBlank()) {
+            try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+                var st = cn.createStatement();
+                var rs = st.executeQuery("SELECT @@VERSION AS v")) {
+                if (rs.next()) {
+                    System.out.println("[CENTRAL][DB] OK conectado. " + rs.getString("v"));
+                }
+            } 
+            catch (Exception e) {
+                System.err.println("[CENTRAL][DB] ERROR conectando: " + e.getMessage());
+            }
+        } 
+        else {
+            System.out.println("[CENTRAL][DB] Desactivada (sin db.url en config)");
+        }
+    }
+
+    private void iniciarWatchdog () {
+        Thread w = new Thread(() -> {
+            while (true) {
+                long now = System.currentTimeMillis();
+                try {
+                    for (Map.Entry<String, CPInfo> e : cps.entrySet()) {
+                        CPInfo info = e.getValue();
+                        long lag = now - info.lastHb;
+
+                        // 3s sin latidos -> marcamos el CP como desconectado,
+                        // pero NO cortamos la sesión en el CP ni enviamos STOP_SUPPLY.
+                        if (lag > 3000) {
+                            synchronized (info) {
+                                if (!"DESCONECTADO".equals(info.estado)) {
+                                    info.estado = "DESCONECTADO";
+                                }
+                            }
+                        }
+                    }
+                    Thread.sleep(1000);
+                } catch (InterruptedException ie) {
+                    return;
+                } catch (Exception ignore) {}
+            }
+        }, "watchdog-central");
+        w.setDaemon(true);
+        w.start();
+    }
+
+    private void iniciarPanel () {
+        Thread t = new Thread(() -> {
+            while (true) {
+                try {
+                    clearConsole();
+                    System.out.println("CENTRAL — Panel CPs (1s)");
+                    System.out.println("CP        | Estado          | Parado | Ocupado | lastHB(ms) | Precio | Sesión     | kWh     | EUR");
+                    System.out.println("----------+-----------------+--------+---------+------------+--------+------------+---------+---------");
+
+                    long now = System.currentTimeMillis();
+                    for (Map.Entry<String, CPInfo> e : cps.entrySet()) {
+                        String cpID = e.getKey();
+                        CPInfo info = e.getValue();
+
+                        String ses = cpSesionesActivas.getOrDefault(cpID, "-");
+                        String est = estadoVisible(info);
+                        long lag = now - info.lastHb;
+
+                        double kwh = 0.0, eur = 0.0;
+                        var sInf = (ses.equals("-") ? null : sesiones.get(ses));
+                        if (sInf != null) { 
+                            kwh = sInf.kWhAccumulado; eur = sInf.eurAccumulado; 
+                        }
+
+                        System.out.printf("%-9s | %-15s | %-6s | %-7s | %10d | %6.2f | %-10s | %7.4f | %7.4f%n",
+                            cpID, est, info.parado ? "SI" : "NO", info.ocupado ? "SI" : "NO",
+                            lag, info.precio, ses, kwh, eur);
+                    }
+
+                    Thread.sleep(1000);
+                } 
+                catch (InterruptedException ie) { return; }
+                catch (Exception ignore) {}
+            }
+        }, "panel-central");
+        t.setDaemon(true);
+        t.start();
+    }
+   
+    private void iniciarHttpStatus (int httpPort) {
+        try {
+            HttpServer http = HttpServer.create(new InetSocketAddress(httpPort), 0);
+
+            // API REST
+            http.createContext("/api/status",   this::handleStatusJson);   // ya lo tenías
+            http.createContext("/api/cps",      this::handleApiCps);       // NUEVO (alias de status)
+            http.createContext("/api/sessions", this::handleApiSessions);  // NUEVO
+            http.createContext("/api/drivers",  this::handleApiDrivers);   // NUEVO
+            http.createContext("/api/weather",  this::handleApiWeather);   // NUEVO (para EV_W)
+
+            // Panel HTML y comandos ya existentes
+            http.createContext("/",  this::handleStatusHtml);
+            http.createContext("/cmd", this::handleCmd);
+
+            http.setExecutor(java.util.concurrent.Executors.newCachedThreadPool());
+            http.start();
+
+            System.out.println("[CENTRAL][HTTP] Panel en http://127.0.0.1:" + httpPort + "/");
+        } 
+        catch (Exception e) {
+            System.err.println("[CENTRAL][HTTP] No se pudo iniciar: " + e.getMessage());
+        }
+    }
+
+    // ============================================================
+    // Conexión TCP con CPMonitor
+    // ============================================================
     private void atender(Socket s) {
         String cliente = s.getRemoteSocketAddress().toString();
         String remoteIp = s.getInetAddress().getHostAddress();
@@ -368,500 +438,9 @@ public class EVCentral {
         return "ACTIVADO";
     }
 
-    private void iniciarPanel () {
-        Thread t = new Thread(() -> {
-            while (true) {
-                try {
-                    clearConsole();
-                    System.out.println("CENTRAL — Panel CPs (1s)");
-                    System.out.println("CP        | Estado          | Parado | Ocupado | lastHB(ms) | Precio | Sesión     | kWh     | EUR");
-                    System.out.println("----------+-----------------+--------+---------+------------+--------+------------+---------+---------");
-
-                    long now = System.currentTimeMillis();
-                    for (Map.Entry<String, CPInfo> e : cps.entrySet()) {
-                        String cpID = e.getKey();
-                        CPInfo info = e.getValue();
-
-                        String ses = cpSesionesActivas.getOrDefault(cpID, "-");
-                        String est = estadoVisible(info);
-                        long lag = now - info.lastHb;
-
-                        double kwh = 0.0, eur = 0.0;
-                        var sInf = (ses.equals("-") ? null : sesiones.get(ses));
-                        if (sInf != null) { 
-                            kwh = sInf.kWhAccumulado; eur = sInf.eurAccumulado; 
-                        }
-
-                        System.out.printf("%-9s | %-15s | %-6s | %-7s | %10d | %6.2f | %-10s | %7.4f | %7.4f%n",
-                            cpID, est, info.parado ? "SI" : "NO", info.ocupado ? "SI" : "NO",
-                            lag, info.precio, ses, kwh, eur);
-                    }
-
-                    Thread.sleep(1000);
-                } 
-                catch (InterruptedException ie) { return; }
-                catch (Exception ignore) {}
-            }
-        }, "panel-central");
-        t.setDaemon(true);
-        t.start();
-    }
-
-    private static void clearConsole (){
-        try {
-            String os = System.getProperty("os.name", "").toLowerCase();
-            if (os.contains("win")) {                      
-            new ProcessBuilder("cmd", "/c", "cls")
-                .inheritIO()                              
-                .start().waitFor();
-            } 
-            else {                                      
-                System.out.print("\033[H\033[2J");
-                System.out.flush();
-            }
-        } catch (Exception e) {
-          
-            for (int i = 0; i < 60; i++) System.out.println();
-        }
-    }
-
-    private static void initDb (Properties config) {
-        DB_URL  = config.getProperty("db.url");
-        DB_USER = config.getProperty("db.user");
-        DB_PASS = config.getProperty("db.pass");
-
-        // Smoke test de conexión (1 vez al inicio)
-        if (DB_URL != null && !DB_URL.isBlank()) {
-            try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
-                var st = cn.createStatement();
-                var rs = st.executeQuery("SELECT @@VERSION AS v")) {
-                if (rs.next()) {
-                    System.out.println("[CENTRAL][DB] OK conectado. " + rs.getString("v"));
-                }
-            } 
-            catch (Exception e) {
-                System.err.println("[CENTRAL][DB] ERROR conectando: " + e.getMessage());
-            }
-        } 
-        else {
-            System.out.println("[CENTRAL][DB] Desactivada (sin db.url en config)");
-        }
-    }
-
-    private void iniciarWatchdog () {
-        Thread w = new Thread(() -> {
-            while (true) {
-                long now = System.currentTimeMillis();
-                try {
-                    for (Map.Entry<String, CPInfo> e : cps.entrySet()) {
-                        CPInfo info = e.getValue();
-                        long lag = now - info.lastHb;
-
-                        // 3s sin latidos -> marcamos el CP como desconectado,
-                        // pero NO cortamos la sesión en el CP ni enviamos STOP_SUPPLY.
-                        if (lag > 3000) {
-                            synchronized (info) {
-                                if (!"DESCONECTADO".equals(info.estado)) {
-                                    info.estado = "DESCONECTADO";
-                                }
-                            }
-                        }
-                    }
-                    Thread.sleep(1000);
-                } catch (InterruptedException ie) {
-                    return;
-                } catch (Exception ignore) {}
-            }
-        }, "watchdog-central");
-        w.setDaemon(true);
-        w.start();
-    }
-
-    private void iniciarHttpStatus (int httpPort) {
-        try {
-            HttpServer http = HttpServer.create(new InetSocketAddress(httpPort), 0);
-            http.createContext("/api/status", this::handleStatusJson);
-            http.createContext("/", this::handleStatusHtml);
-            http.createContext("/cmd", this::handleCmd);
-            http.setExecutor(java.util.concurrent.Executors.newCachedThreadPool());
-            http.start();
-
-            System.out.println("[CENTRAL][HTTP] Panel en http://127.0.0.1:" + httpPort + "/");
-        } 
-        catch (Exception e) {
-            System.err.println("[CENTRAL][HTTP] No se pudo iniciar: " + e.getMessage());
-        }
-}
-
-    private void handleStatusJson (HttpExchange ex) {
-        try {
-            String json = buildStatusJson();
-            byte[] body = json.getBytes(StandardCharsets.UTF_8);
-            ex.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
-            ex.sendResponseHeaders(200, body.length);
-            ex.getResponseBody().write(body);
-        } catch (Exception ignore) {} 
-        finally {
-            ex.close();
-        }
-    }
-
-    private void handleStatusHtml (HttpExchange ex) {
-        try {
-            String html = """
-                <html><head><meta charset="utf-8">
-                <meta http-equiv="refresh" content="1">
-                <style>
-                    body{font-family:system-ui;margin:16px}
-                    table{border-collapse:collapse;width:100%}
-                    th,td{border:1px solid #ddd;padding:8px;text-align:left}
-                    th{background:#f6f7f9;position:sticky;top:0}
-                    tr.ACTIVADO{ background:#e8f7e8 }
-                    tr.SUMINISTRANDO{ background:#c9f7c9 }
-                    tr.PARADO{ background:#ffe9cc }
-                    tr.AVERIADO{ background:#ffd6d6 }
-                    tr.DESCONECTADO{ background:#eeeeee }
-                    .muted{color:#666}
-                </style>
-                <title>EV Central - Panel</title></head><body>
-                <h2>EV Central — Panel</h2>
-                <table>
-                    <thead>
-                    <tr>
-                        <th>CP</th><th>Ubicación</th><th>Estado</th><th>Parado</th><th>Ocupado</th>
-                        <th>lastHB (ms)</th><th>Precio</th><th>Sesión</th><th>Driver</th><th>kWh</th><th>€</th>
-                    </tr>
-                    </thead>
-                    <tbody>
-                    %ROWS%
-                    </tbody>
-                </table>
-                <p class="muted">Actualiza cada 1s. Colores: Verde=Activado/Suministrando, Naranja=Parado, Rojo=Averiado, Gris=Desconectado.</p>
-                </body></html>
-            """;
-            String rows = buildStatusRowsHtml();
-            byte[] body = html.replace("%ROWS%", rows).getBytes(StandardCharsets.UTF_8);
-            ex.getResponseHeaders().add("Content-Type", "text/html; charset=utf-8");
-            ex.sendResponseHeaders(200, body.length);
-            ex.getResponseBody().write(body);
-        } 
-        catch (Exception ignore) {} 
-        finally {
-            ex.close();
-        }
-    }
-
-    private String buildStatusJson () {
-        long now = System.currentTimeMillis();
-        var sb = new StringBuilder();
-        sb.append("{\"items\":[");
-        boolean first = true;
-        for (var e : cps.entrySet()) {
-            String cpID = e.getKey();
-            CPInfo info = e.getValue();
-
-            String estado; boolean ocupado; boolean parado; long last;
-            double precio;
-            synchronized (info) {               // ← snapshot coherente
-                estado = info.estado;
-                ocupado= info.ocupado;
-                parado = info.parado;
-                last   = info.lastHb;
-                precio = info.precio;
-            }
-
-            String sesion = cpSesionesActivas.getOrDefault(cpID, "-");
-            var sInf = sesiones.get(sesion);
-            double kwh = (sInf != null) ? sInf.kWhAccumulado : 0.0;
-            double eur = (sInf != null) ? sInf.eurAccumulado : 0.0;
-
-            long lag = now - info.lastHb;
-
-            if (!first) sb.append(',');
-            first = false;
-            sb.append("{")
-            .append("\"cp\":\"").append(cpID).append("\",")
-            .append("\"estado\":\"").append(estado).append("\",")
-            .append("\"parado\":").append(info.parado).append(',')
-            .append("\"ocupado\":").append(info.ocupado).append(',')
-            .append("\"lastHbMs\":").append(lag).append(',')
-            .append("\"precio\":").append(String.format(java.util.Locale.ROOT,"%.4f", info.precio)).append(',')
-            .append("\"sesion\":\"").append("-".equals(sesion)?"":sesion).append("\",")
-            .append("\"kwh\":").append(String.format(java.util.Locale.ROOT,"%.5f", kwh)).append(',')
-            .append("\"eur\":").append(String.format(java.util.Locale.ROOT,"%.4f", eur))
-            .append("}");
-        }
-        sb.append("]}");
-        return sb.toString();
-    }
-
-    private String toHtml(String s){
-        if (s == null) return "";
-        return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;");
-    }
-
-    private String buildStatusRowsHtml() {
-        long now = System.currentTimeMillis();
-        StringBuilder sb = new StringBuilder();
-
-        for (var e : cps.entrySet()) {
-            String cpID = e.getKey();
-            CPInfo info = e.getValue();
-
-            String sesion = cpSesionesActivas.getOrDefault(cpID, "-");
-            var sInf = sesiones.get(sesion);
-            double kwh = (sInf != null) ? sInf.kWhAccumulado : 0.0;
-            double eur = (sInf != null) ? sInf.eurAccumulado : 0.0;
-            String driver = (sInf != null) ? sInf.driverID : "";
-
-            String est = estadoVisible(info);
-            long lag = now - info.lastHb;
-
-            String encCp = java.net.URLEncoder.encode(cpID, StandardCharsets.UTF_8);
-            String acc = "<a href='/cmd?op=PAUSE&cp="+encCp+"'>PAUSE</a> | "
-                + "<a href='/cmd?op=RESUME&cp="+encCp+"'>RESUME</a> | "
-                + "<a href='/cmd?op=STOP&cp="+encCp+"'>STOP</a>";
-
-            sb.append("<tr class='").append(est).append("'>")
-            .append("<td>").append(toHtml(cpID)).append("</td>")
-            .append("<td>").append(toHtml(info.ubicacion!=null?info.ubicacion:"")).append("</td>")
-            .append("<td>").append(est).append("</td>")
-            .append("<td>").append(info.parado ? "SI" : "NO").append("</td>")
-            .append("<td>").append(info.ocupado ? "SI" : "NO").append("</td>")
-            .append("<td>").append(lag).append("</td>")
-            .append("<td>").append(String.format(java.util.Locale.ROOT,"%.4f", info.precio)).append("</td>")
-            .append("<td>").append("-".equals(sesion) ? "" : toHtml(sesion)).append("</td>")
-            .append("<td>").append(toHtml(driver)).append("</td>")
-            .append("<td>").append(String.format(java.util.Locale.ROOT,"%.5f", kwh)).append("</td>")
-            .append("<td>").append(String.format(java.util.Locale.ROOT,"%.4f", eur)).append("</td>")
-            .append("<td>").append(acc).append("</td>")
-            .append("</tr>");
-        }
-        return sb.toString();
-    }
-
-    private static void dbLoadCPs() {
-        if (DB_URL == null || DB_URL.isBlank()) {
-            return;
-        }
-        try (var conn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
-            var st = conn.createStatement();
-            var rs = st.executeQuery("SELECT cp_id, location_tag, price_eur_kwh FROM ChargingPoint")) {
-                int n = 0;
-                while (rs.next()) {
-                    String cp = rs.getString(1), ubicacion = rs.getString(2);
-                    double precio = rs.getBigDecimal(3).doubleValue();
-                    CPInfo info = cps .computeIfAbsent(cp, _ -> new CPInfo());
-                    info.cpID = cp;
-                    info.ubicacion = ubicacion;
-                    info.precio = precio;
-                    info.estado = "DESCONECTADO";
-                    info.ocupado = false;
-                    info.parado = false;
-                    info.lastHb = 0L;
-                    n++;
-                }
-                System.out.println("[CENTRAL][DB] CPs precargados: " + n);                
-        } catch (Exception e) {
-            System.err.println("[CENTRAL][DB] dbLoader ERROR: " + e.getMessage());
-        }
-    }
-    
-    private AuthResult autenticarCpEnBd(String cpId, String secret, String remoteIp) {
-        // Si no hay BD configurada, aceptamos todo y solo generamos la clave
-        if (DB_URL == null || DB_URL.isBlank()) {
-            String key = getOrCreateCpKey(cpId);
-            audit("AUTH_CP_OK", "CP=" + cpId + " ip=" + remoteIp,
-                  "DB_URL vacía; clave generada=" + key);
-            return new AuthResult(true, key, null);
-        }
-
-        try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
-             var ps = cn.prepareStatement(
-                     "SELECT secret, status FROM EV_CP_REGISTRY WHERE cp_id = ?")) {
-
-            ps.setString(1, cpId);
-            try (var rs = ps.executeQuery()) {
-                if (!rs.next()) {
-                    audit("AUTH_CP_FAIL", "CP=" + cpId + " ip=" + remoteIp,
-                          "reason=NOT_REGISTERED");
-                    return new AuthResult(false, null, "NOT_REGISTERED");
-                }
-
-                String dbSecret = rs.getString("secret");
-                String status   = rs.getString("status");
-
-                if (!"ACTIVO".equalsIgnoreCase(status)) {
-                    audit("AUTH_CP_FAIL", "CP=" + cpId + " ip=" + remoteIp,
-                          "reason=NOT_ACTIVE status=" + status);
-                    return new AuthResult(false, null, "NOT_ACTIVE");
-                }
-
-                if (!dbSecret.equals(secret)) {
-                    audit("AUTH_CP_FAIL", "CP=" + cpId + " ip=" + remoteIp,
-                          "reason=BAD_SECRET");
-                    return new AuthResult(false, null, "BAD_SECRET");
-                }
-            }
-
-            String key = getOrCreateCpKey(cpId);
-            audit("AUTH_CP_OK", "CP=" + cpId + " ip=" + remoteIp,
-                  "Clave asignada=" + key);
-            return new AuthResult(true, key, null);
-
-        } catch (Exception e) {
-            audit("AUTH_CP_ERROR", "CP=" + cpId + " ip=" + remoteIp,
-                  "reason=DB_ERROR msg=" + e.getMessage());
-            return new AuthResult(false, null, "DB_ERROR");
-        }
-    }
-
-    private static void dbLoadDrivers() {
-        if (DB_URL==null || DB_URL.isBlank()) return;
-        try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
-             var st = cn.createStatement();
-             var rs = st.executeQuery("SELECT driver_id FROM dbo.Driver")) {
-            while (rs.next()) driversValidos.add(rs.getString(1));
-            System.out.println("[CENTRAL][DB] Drivers precargados: "+driversValidos.size());
-        } 
-        catch (Exception e) {
-            System.err.println("[CENTRAL][DB] dbLoadDrivers ERROR: " + e.getMessage()); 
-        }
-    }
-
-    private static void dbUpsertCP(String cpID, String loc, double price) {
-        if (DB_URL == null || DB_URL.isBlank()) return;
-        final String sql = """
-            MERGE dbo.ChargingPoint AS t
-            USING (SELECT ? AS cp_id, ? AS location_tag, ? AS price_eur_kwh) AS s
-                (cp_id, location_tag, price_eur_kwh)
-            ON (t.cp_id = s.cp_id)
-            WHEN MATCHED THEN
-                UPDATE SET t.location_tag = s.location_tag,
-                        t.price_eur_kwh = s.price_eur_kwh
-            WHEN NOT MATCHED THEN
-                INSERT (cp_id, location_tag, price_eur_kwh)
-                VALUES (s.cp_id, s.location_tag, s.price_eur_kwh);
-        """;
-        try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
-            var ps = cn.prepareStatement(sql)) {
-            ps.setString(1, cpID);
-            ps.setString(2, loc);
-            ps.setBigDecimal(3, java.math.BigDecimal.valueOf(price).setScale(4, java.math.RoundingMode.HALF_UP));
-            ps.executeUpdate();
-            System.out.println("[CENTRAL][DB] CP upsert: " + cpID + " (" + loc + ", " + price + ")");
-        } catch (Exception e) {
-            System.err.println("[CENTRAL][DB] dbUpsertCP ERROR: " + e.getMessage());
-        }
-    }
-
-    private boolean ensureDriver(String driverID) {
-        if (driverID == null || driverID.isBlank()) return false; // en memoria ya conocido
-        if (driversValidos.contains(driverID)) return true; // si no hay BD, lo aceptamos y cacheamos
-        if (DB_URL == null || DB_URL.isBlank()) {
-            driversValidos.add(driverID);
-            System.out.println("[CENTRAL] (MEM) Nuevo driver: " + driverID);
-            return true;
-        }
-
-        String sql = """
-            MERGE dbo.Driver AS t
-            USING (SELECT ? AS driver_id) AS s
-            ON (t.driver_id = s.driver_id)
-            WHEN NOT MATCHED THEN INSERT(driver_id) VALUES (s.driver_id);
-        """;
-
-        try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
-            var ps = cn.prepareStatement(sql)) {
-            ps.setString(1, driverID);
-            ps.executeUpdate();
-            driversValidos.add(driverID);
-            System.out.println("[CENTRAL][DB] Driver asegurado: " + driverID);
-            return true;
-        } 
-        catch (Exception e) {
-            System.err.println("[CENTRAL][DB] ensureDriver ERROR: " + e.getMessage());
-            // En caso de fallo de BD, acepta en memoria
-            driversValidos.add(driverID);
-            return true;
-        }
-    }
-
-    private void handleCmd(com.sun.net.httpserver.HttpExchange ex) { 
-        try {
-            var q = ex.getRequestURI().getQuery();
-            String op=null, cp=null;
-            if (q != null) {
-                for (String kv : q.split("&")) {
-                    int i = kv.indexOf('=');
-                    if (i>0) {
-                        String k = java.net.URLDecoder.decode(kv.substring(0,i), StandardCharsets.UTF_8);
-                        String v = java.net.URLDecoder.decode(kv.substring(i+1), StandardCharsets.UTF_8);
-                        if ("op".equalsIgnoreCase(k)) op=v.toUpperCase();
-                        if ("cp".equalsIgnoreCase(k)) cp=v;
-                    }
-                }
-            }
-            String msg = "ERR missing op/cp";
-            if (op!=null && cp!=null) {
-                switch (op) {
-                    case "PAUSE"  -> msg = pauseCp(cp);
-                    case "RESUME" -> msg = resumeCp(cp);
-                    case "STOP"   -> msg = stopCp(cp);
-                    default       -> msg = "ERR unknown op";
-                }
-            }
-
-            String target = "/?msg=" + java.net.URLEncoder.encode(msg, java.nio.charset.StandardCharsets.UTF_8);
-            ex.getResponseHeaders().add("Location", target);
-            ex.sendResponseHeaders(303, -1);
-        } 
-        catch (Exception ignore) {} 
-        finally { 
-            ex.close(); 
-        }
-    }
-    
-    private String pauseCp(String cpID){
-        applyPauseLocal(cpID);
-        markStopRequested(cpID);
-
-        audit("CP_CMD", "CP=" + cpID, "op=PAUSE via HTTP_PANEL");
-
-        com.google.gson.JsonObject inner = obj("type","CMD","src","CENTRAL","ts",System.currentTimeMillis(),
-                                               "cmd","STOP_SUPPLY","cp",cpID);
-        com.google.gson.JsonObject enc = encryptForCp(cpID, inner);
-        bus.publish(T_CMD, cpID, enc);
-
-        return "ACK PAUSE " + cpID + " (STOP_SUPPLY publicado)";
-    }
-
-    private String resumeCp(String cpID){
-        applyResumeLocal(cpID);
-
-        audit("CP_CMD", "CP=" + cpID, "op=RESUME via HTTP_PANEL");
-
-        com.google.gson.JsonObject inner = obj("type","CMD","src","CENTRAL","ts",System.currentTimeMillis(),
-                                               "cmd","RESUME","cp",cpID);
-        com.google.gson.JsonObject enc = encryptForCp(cpID, inner);
-        bus.publish(T_CMD, cpID, enc);
-
-        return "ACK RESUME " + cpID + " (RESUME publicado)";
-    }
-
-    private String stopCp(String cpID){
-        markStopRequested(cpID);
-
-        audit("CP_CMD", "CP=" + cpID, "op=STOP via HTTP_PANEL");
-
-        com.google.gson.JsonObject inner = obj("type","CMD","src","CENTRAL","ts",System.currentTimeMillis(),
-                                               "cmd","STOP_SUPPLY","cp",cpID);
-        com.google.gson.JsonObject enc = encryptForCp(cpID, inner);
-        bus.publish(T_CMD, cpID, enc);
-
-        return "ACK STOP " + cpID + " (STOP_SUPPLY publicado)";
-    }
-
+    // ============================================================
+    // Integración con Kafka (drivers / engine)
+    // ============================================================
     private void onKafkaCmd(com.google.gson.JsonObject m) {
         try {
             if (!m.has("type") || !"CMD".equals(m.get("type").getAsString())) return;
@@ -1131,6 +710,422 @@ public class EVCentral {
         }
     }
 
+    // ============================================================
+    // HTTP: Panel y API REST
+    // ============================================================
+    private void handleStatusJson (HttpExchange ex) {
+        try {
+            String json = buildStatusJson();
+            byte[] body = json.getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
+            ex.sendResponseHeaders(200, body.length);
+            ex.getResponseBody().write(body);
+        } catch (Exception ignore) {} 
+        finally {
+            ex.close();
+        }
+    }
+
+    private void handleStatusHtml (HttpExchange ex) {
+        try {
+            String html = """
+                <html><head><meta charset="utf-8">
+                <meta http-equiv="refresh" content="1">
+                <style>
+                    body{font-family:system-ui;margin:16px}
+                    table{border-collapse:collapse;width:100%}
+                    th,td{border:1px solid #ddd;padding:8px;text-align:left}
+                    th{background:#f6f7f9;position:sticky;top:0}
+                    tr.ACTIVADO{ background:#e8f7e8 }
+                    tr.SUMINISTRANDO{ background:#c9f7c9 }
+                    tr.PARADO{ background:#ffe9cc }
+                    tr.AVERIADO{ background:#ffd6d6 }
+                    tr.DESCONECTADO{ background:#eeeeee }
+                    .muted{color:#666}
+                </style>
+                <title>EV Central - Panel</title></head><body>
+                <h2>EV Central — Panel</h2>
+                <table>
+                    <thead>
+                    <tr>
+                        <th>CP</th><th>Ubicación</th><th>Estado</th><th>Parado</th><th>Ocupado</th>
+                        <th>lastHB (ms)</th><th>Precio</th><th>Sesión</th><th>Driver</th><th>kWh</th><th>€</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    %ROWS%
+                    </tbody>
+                </table>
+                <p class="muted">Actualiza cada 1s. Colores: Verde=Activado/Suministrando, Naranja=Parado, Rojo=Averiado, Gris=Desconectado.</p>
+                </body></html>
+            """;
+            String rows = buildStatusRowsHtml();
+            byte[] body = html.replace("%ROWS%", rows).getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().add("Content-Type", "text/html; charset=utf-8");
+            ex.sendResponseHeaders(200, body.length);
+            ex.getResponseBody().write(body);
+        } 
+        catch (Exception ignore) {} 
+        finally {
+            ex.close();
+        }
+    }
+    
+    private void handleCmd(com.sun.net.httpserver.HttpExchange ex) { 
+        try {
+            var q = ex.getRequestURI().getQuery();
+            String op=null, cp=null;
+            if (q != null) {
+                for (String kv : q.split("&")) {
+                    int i = kv.indexOf('=');
+                    if (i>0) {
+                        String k = java.net.URLDecoder.decode(kv.substring(0,i), StandardCharsets.UTF_8);
+                        String v = java.net.URLDecoder.decode(kv.substring(i+1), StandardCharsets.UTF_8);
+                        if ("op".equalsIgnoreCase(k)) op=v.toUpperCase();
+                        if ("cp".equalsIgnoreCase(k)) cp=v;
+                    }
+                }
+            }
+            String msg = "ERR missing op/cp";
+            if (op!=null && cp!=null) {
+                switch (op) {
+                    case "PAUSE"  -> msg = pauseCp(cp);
+                    case "RESUME" -> msg = resumeCp(cp);
+                    case "STOP"   -> msg = stopCp(cp);
+                    default       -> msg = "ERR unknown op";
+                }
+            }
+
+            String target = "/?msg=" + java.net.URLEncoder.encode(msg, java.nio.charset.StandardCharsets.UTF_8);
+            ex.getResponseHeaders().add("Location", target);
+            ex.sendResponseHeaders(303, -1);
+        } 
+        catch (Exception ignore) {} 
+        finally { 
+            ex.close(); 
+        }
+    }
+    
+    // ============================================================
+    // HTTP: API REST
+    // ============================================================
+        // GET /api/cps  -> mismo JSON que /api/status
+    private void handleApiCps(HttpExchange ex) {
+        try {
+            if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
+                ex.getResponseHeaders().add("Allow", "GET");
+                ex.sendResponseHeaders(405, -1);
+                return;
+            }
+            String json = buildStatusJson();
+            byte[] body = json.getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
+            ex.sendResponseHeaders(200, body.length);
+            ex.getResponseBody().write(body);
+        } catch (Exception ignore) {
+        } finally {
+            ex.close();
+        }
+    }
+        // GET /api/sessions
+    private void handleApiSessions(HttpExchange ex) {
+        try {
+            if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
+                ex.getResponseHeaders().add("Allow", "GET");
+                ex.sendResponseHeaders(405, -1);
+                return;
+            }
+            String json = buildSessionsJson();
+            byte[] body = json.getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
+            ex.sendResponseHeaders(200, body.length);
+            ex.getResponseBody().write(body);
+        } catch (Exception ignore) {
+        } finally {
+            ex.close();
+        }
+    }
+        // GET /api/drivers
+    private void handleApiDrivers(HttpExchange ex) {
+        try {
+            if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
+                ex.getResponseHeaders().add("Allow", "GET");
+                ex.sendResponseHeaders(405, -1);
+                return;
+            }
+            String json = buildDriversJson();
+            byte[] body = json.getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
+            ex.sendResponseHeaders(200, body.length);
+            ex.getResponseBody().write(body);
+        } catch (Exception ignore) {
+        } finally {
+            ex.close();
+        }
+    }
+        // POST /api/weather  (llamado por EV_W)
+    private void handleApiWeather(HttpExchange ex) {
+        try {
+            if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
+                ex.getResponseHeaders().add("Allow", "POST");
+                ex.sendResponseHeaders(405, -1);
+                return;
+            }
+
+            String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            com.google.gson.JsonObject msg;
+            try {
+                msg = JSON.parse(body).getAsJsonObject();
+            } catch (Exception e) {
+                ex.sendResponseHeaders(400, -1);
+                return;
+            }
+
+            String cpID = msg.has("cp") ? msg.get("cp").getAsString().toUpperCase(java.util.Locale.ROOT) : null;
+            String loc  = msg.has("loc") ? msg.get("loc").getAsString() : null;
+            double tempC = msg.has("tempC") ? msg.get("tempC").getAsDouble() : Double.NaN;
+            boolean alert = msg.has("alert") && msg.get("alert").getAsBoolean();
+
+            if (cpID == null || cpID.isBlank()) {
+                ex.sendResponseHeaders(400, -1);
+                return;
+            }
+
+            WeatherInfo w = cpWeather.computeIfAbsent(cpID, _ -> new WeatherInfo());
+            w.loc = loc;
+            w.tempC = tempC;
+            w.alert = alert;
+            w.lastUpdate = System.currentTimeMillis();
+
+            String fromIp = ex.getRemoteAddress().getAddress().getHostAddress();
+            CPInfo info = cps.get(cpID);
+
+            if (alert) {
+                // ---- ALERTA: bajar CP por clima ----
+                if (info != null) {
+                    synchronized (info) {
+                        info.parado = true;
+                        info.estado = "PARADO";  // “fuera de servicio” por clima
+                    }
+                }
+
+                // Si hay sesión en curso, pedimos STOP_SUPPLY
+                markStopRequested(cpID);
+                com.google.gson.JsonObject inner = obj(
+                        "type","CMD","src","CENTRAL","ts",System.currentTimeMillis(),
+                        "cmd","STOP_SUPPLY","cp",cpID,"reason","WEATHER_ALERT"
+                );
+                com.google.gson.JsonObject enc = encryptForCp(cpID, inner);
+                bus.publish(T_CMD, cpID, enc);
+
+                audit("WEATHER_ALERT", "EV_W ip=" + fromIp,
+                      "cp=" + cpID + " loc=" + loc + " tempC=" + tempC);
+            } else {
+                // ---- Recuperación: volver a operar si no está averiado ni ocupado ----
+                if (info != null) {
+                    synchronized (info) {
+                        info.parado = false;
+                        if (!info.ocupado && !"AVERIADO".equals(info.estado)) {
+                            info.estado = "ACTIVADO";
+                        }
+                    }
+                }
+                audit("WEATHER_CLEAR", "EV_W ip=" + fromIp,
+                      "cp=" + cpID + " loc=" + loc + " tempC=" + tempC);
+            }
+
+            byte[] resp = "{\"ok\":true}".getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
+            ex.sendResponseHeaders(200, resp.length);
+            ex.getResponseBody().write(resp);
+        } catch (Exception e) {
+            try { ex.sendResponseHeaders(500, -1); } catch (Exception ignore) {}
+        } finally {
+            ex.close();
+        }
+    }
+    
+    // ============================================================
+    // Construcciones
+    // ============================================================
+    private String buildDriversJson() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"items\":[");
+        boolean first = true;
+        for (String drv : driversValidos) {
+            if (!first) sb.append(',');
+            first = false;
+            sb.append("{\"driver\":\"").append(drv).append("\"}");
+        }
+        sb.append("]}");
+        return sb.toString();
+    }
+    
+    private String buildStatusRowsHtml() {
+        long now = System.currentTimeMillis();
+        StringBuilder sb = new StringBuilder();
+
+        for (var e : cps.entrySet()) {
+            String cpID = e.getKey();
+            CPInfo info = e.getValue();
+
+            String sesion = cpSesionesActivas.getOrDefault(cpID, "-");
+            var sInf = sesiones.get(sesion);
+            double kwh = (sInf != null) ? sInf.kWhAccumulado : 0.0;
+            double eur = (sInf != null) ? sInf.eurAccumulado : 0.0;
+            String driver = (sInf != null) ? sInf.driverID : "";
+
+            String est = estadoVisible(info);
+            long lag = now - info.lastHb;
+
+            String encCp = java.net.URLEncoder.encode(cpID, StandardCharsets.UTF_8);
+            String acc = "<a href='/cmd?op=PAUSE&cp="+encCp+"'>PAUSE</a> | "
+                + "<a href='/cmd?op=RESUME&cp="+encCp+"'>RESUME</a> | "
+                + "<a href='/cmd?op=STOP&cp="+encCp+"'>STOP</a>";
+
+            sb.append("<tr class='").append(est).append("'>")
+            .append("<td>").append(toHtml(cpID)).append("</td>")
+            .append("<td>").append(toHtml(info.ubicacion!=null?info.ubicacion:"")).append("</td>")
+            .append("<td>").append(est).append("</td>")
+            .append("<td>").append(info.parado ? "SI" : "NO").append("</td>")
+            .append("<td>").append(info.ocupado ? "SI" : "NO").append("</td>")
+            .append("<td>").append(lag).append("</td>")
+            .append("<td>").append(String.format(java.util.Locale.ROOT,"%.4f", info.precio)).append("</td>")
+            .append("<td>").append("-".equals(sesion) ? "" : toHtml(sesion)).append("</td>")
+            .append("<td>").append(toHtml(driver)).append("</td>")
+            .append("<td>").append(String.format(java.util.Locale.ROOT,"%.5f", kwh)).append("</td>")
+            .append("<td>").append(String.format(java.util.Locale.ROOT,"%.4f", eur)).append("</td>")
+            .append("<td>").append(acc).append("</td>")
+            .append("</tr>");
+        }
+        return sb.toString();
+    }
+
+    private String buildSessionsJson() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"items\":[");
+        boolean first = true;
+        for (var e : sesiones.entrySet()) {
+            SesionInfo s = e.getValue();
+            if (!first) sb.append(',');
+            first = false;
+            sb.append("{")
+              .append("\"session\":\"").append(s.sesionID).append("\",")
+              .append("\"cp\":\"").append(s.cpID).append("\",")
+              .append("\"driver\":\"").append(s.driverID).append("\",")
+              .append("\"startUTC\":").append(s.startUTC).append(',')
+              .append("\"kwh\":").append(String.format(java.util.Locale.ROOT,"%.5f", s.kWhAccumulado)).append(',')
+              .append("\"eur\":").append(String.format(java.util.Locale.ROOT,"%.4f", s.eurAccumulado))
+              .append("}");
+        }
+        sb.append("]}");
+        return sb.toString();
+    }
+
+    private String buildStatusJson () {
+        long now = System.currentTimeMillis();
+        var sb = new StringBuilder();
+        sb.append("{\"items\":[");
+        boolean first = true;
+        for (var e : cps.entrySet()) {
+            String cpID = e.getKey();
+            CPInfo info = e.getValue();
+
+            String estado; boolean ocupado; boolean parado; long last;
+            double precio;
+            synchronized (info) {               // snapshot coherente
+                estado = info.estado;
+                ocupado = info.ocupado;
+                parado  = info.parado;
+                last    = info.lastHb;
+                precio  = info.precio;
+            }
+
+            String sesion = cpSesionesActivas.getOrDefault(cpID, "-");
+            var sInf = sesiones.get(sesion);
+            double kwh = (sInf != null) ? sInf.kWhAccumulado : 0.0;
+            double eur = (sInf != null) ? sInf.eurAccumulado : 0.0;
+
+            long lag = now - last;
+
+            WeatherInfo w = cpWeather.get(cpID);
+            boolean wAlert = (w != null && w.alert);
+            double tempC   = (w != null ? w.tempC : Double.NaN);
+
+            if (!first) sb.append(',');
+            first = false;
+            sb.append("{")
+              .append("\"cp\":\"").append(cpID).append("\",")
+              .append("\"estado\":\"").append(estado).append("\",")
+              .append("\"parado\":").append(parado).append(',')
+              .append("\"ocupado\":").append(ocupado).append(',')
+              .append("\"lastHbMs\":").append(lag).append(',')
+              .append("\"precio\":").append(String.format(java.util.Locale.ROOT,"%.4f", precio)).append(',')
+              .append("\"sesion\":\"").append("-".equals(sesion) ? "" : sesion).append("\",")
+              .append("\"kwh\":").append(String.format(java.util.Locale.ROOT,"%.5f", kwh)).append(',')
+              .append("\"eur\":").append(String.format(java.util.Locale.ROOT,"%.4f", eur)).append(',')
+              .append("\"weatherAlert\":").append(wAlert).append(',')
+              .append("\"tempC\":");
+            if (Double.isNaN(tempC)) {
+                sb.append("null");
+            } else {
+                sb.append(String.format(java.util.Locale.ROOT,"%.2f", tempC));
+            }
+            sb.append("}");
+        }
+        sb.append("]}");
+        return sb.toString();
+    }
+
+    private String toHtml(String s){
+        if (s == null) return "";
+        return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;");
+    }
+
+    // ============================================================
+    // Lógica de negocio CP / Sesiones
+    // ============================================================
+    private String pauseCp(String cpID){
+        applyPauseLocal(cpID);
+        markStopRequested(cpID);
+
+        audit("CP_CMD", "CP=" + cpID, "op=PAUSE via HTTP_PANEL");
+
+        com.google.gson.JsonObject inner = obj("type","CMD","src","CENTRAL","ts",System.currentTimeMillis(),
+                                               "cmd","STOP_SUPPLY","cp",cpID);
+        com.google.gson.JsonObject enc = encryptForCp(cpID, inner);
+        bus.publish(T_CMD, cpID, enc);
+
+        return "ACK PAUSE " + cpID + " (STOP_SUPPLY publicado)";
+    }
+
+    private String resumeCp(String cpID){
+        applyResumeLocal(cpID);
+
+        audit("CP_CMD", "CP=" + cpID, "op=RESUME via HTTP_PANEL");
+
+        com.google.gson.JsonObject inner = obj("type","CMD","src","CENTRAL","ts",System.currentTimeMillis(),
+                                               "cmd","RESUME","cp",cpID);
+        com.google.gson.JsonObject enc = encryptForCp(cpID, inner);
+        bus.publish(T_CMD, cpID, enc);
+
+        return "ACK RESUME " + cpID + " (RESUME publicado)";
+    }
+
+    private String stopCp(String cpID){
+        markStopRequested(cpID);
+
+        audit("CP_CMD", "CP=" + cpID, "op=STOP via HTTP_PANEL");
+
+        com.google.gson.JsonObject inner = obj("type","CMD","src","CENTRAL","ts",System.currentTimeMillis(),
+                                               "cmd","STOP_SUPPLY","cp",cpID);
+        com.google.gson.JsonObject enc = encryptForCp(cpID, inner);
+        bus.publish(T_CMD, cpID, enc);
+
+        return "ACK STOP " + cpID + " (STOP_SUPPLY publicado)";
+    }
+
+
     private void applyPauseLocal(String cpID){
         CPInfo info = cps.get(cpID);
         if (info == null) return;
@@ -1151,6 +1146,225 @@ public class EVCentral {
         if (sId != null) stopSolicitado.add(sId);
     }
 
+    
+    private boolean ensureDriver(String driverID) {
+        if (driverID == null || driverID.isBlank()) return false; // en memoria ya conocido
+        if (driversValidos.contains(driverID)) return true; // si no hay BD, lo aceptamos y cacheamos
+        if (DB_URL == null || DB_URL.isBlank()) {
+            driversValidos.add(driverID);
+            System.out.println("[CENTRAL] (MEM) Nuevo driver: " + driverID);
+            return true;
+        }
+
+        String sql = """
+            MERGE dbo.Driver AS t
+            USING (SELECT ? AS driver_id) AS s
+            ON (t.driver_id = s.driver_id)
+            WHEN NOT MATCHED THEN INSERT(driver_id) VALUES (s.driver_id);
+        """;
+
+        try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+            var ps = cn.prepareStatement(sql)) {
+            ps.setString(1, driverID);
+            ps.executeUpdate();
+            driversValidos.add(driverID);
+            System.out.println("[CENTRAL][DB] Driver asegurado: " + driverID);
+            return true;
+        } 
+        catch (Exception e) {
+            System.err.println("[CENTRAL][DB] ensureDriver ERROR: " + e.getMessage());
+            // En caso de fallo de BD, acepta en memoria
+            driversValidos.add(driverID);
+            return true;
+        }
+    }
+    
+    // ============================================================
+    // Acceso a BD
+    // ============================================================
+    private static void dbLoadCPs() {
+        if (DB_URL == null || DB_URL.isBlank()) {
+            return;
+        }
+        try (var conn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+            var st = conn.createStatement();
+            var rs = st.executeQuery("SELECT cp_id, location_tag, price_eur_kwh FROM ChargingPoint")) {
+                int n = 0;
+                while (rs.next()) {
+                    String cp = rs.getString(1), ubicacion = rs.getString(2);
+                    double precio = rs.getBigDecimal(3).doubleValue();
+                    CPInfo info = cps .computeIfAbsent(cp, _ -> new CPInfo());
+                    info.cpID = cp;
+                    info.ubicacion = ubicacion;
+                    info.precio = precio;
+                    info.estado = "DESCONECTADO";
+                    info.ocupado = false;
+                    info.parado = false;
+                    info.lastHb = 0L;
+                    n++;
+                }
+                System.out.println("[CENTRAL][DB] CPs precargados: " + n);                
+        } catch (Exception e) {
+            System.err.println("[CENTRAL][DB] dbLoader ERROR: " + e.getMessage());
+        }
+    }
+    
+    private static void dbLoadDrivers() {
+        if (DB_URL==null || DB_URL.isBlank()) return;
+        try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+             var st = cn.createStatement();
+             var rs = st.executeQuery("SELECT driver_id FROM dbo.Driver")) {
+            while (rs.next()) driversValidos.add(rs.getString(1));
+            System.out.println("[CENTRAL][DB] Drivers precargados: "+driversValidos.size());
+        } 
+        catch (Exception e) {
+            System.err.println("[CENTRAL][DB] dbLoadDrivers ERROR: " + e.getMessage()); 
+        }
+    }
+
+    private static void dbUpsertCP(String cpID, String loc, double price) {
+        if (DB_URL == null || DB_URL.isBlank()) return;
+        final String sql = """
+            MERGE dbo.ChargingPoint AS t
+            USING (SELECT ? AS cp_id, ? AS location_tag, ? AS price_eur_kwh) AS s
+                (cp_id, location_tag, price_eur_kwh)
+            ON (t.cp_id = s.cp_id)
+            WHEN MATCHED THEN
+                UPDATE SET t.location_tag = s.location_tag,
+                        t.price_eur_kwh = s.price_eur_kwh
+            WHEN NOT MATCHED THEN
+                INSERT (cp_id, location_tag, price_eur_kwh)
+                VALUES (s.cp_id, s.location_tag, s.price_eur_kwh);
+        """;
+        try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+            var ps = cn.prepareStatement(sql)) {
+            ps.setString(1, cpID);
+            ps.setString(2, loc);
+            ps.setBigDecimal(3, java.math.BigDecimal.valueOf(price).setScale(4, java.math.RoundingMode.HALF_UP));
+            ps.executeUpdate();
+            System.out.println("[CENTRAL][DB] CP upsert: " + cpID + " (" + loc + ", " + price + ")");
+        } catch (Exception e) {
+            System.err.println("[CENTRAL][DB] dbUpsertCP ERROR: " + e.getMessage());
+        }
+    }
+
+    
+    private void dbOpenSession (String sID, String cpID, String driverID, double precio){
+        try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+             var st = cn.prepareCall("{call dbo.spOpenSession(?,?,?,?,?)}")) {
+            st.setString(1, sID);
+            st.setString(2, cpID);
+            st.setString(3, driverID);
+            st.setBigDecimal(4, java.math.BigDecimal.valueOf(precio).setScale(4, java.math.RoundingMode.HALF_UP));
+            st.setTimestamp(5, java.sql.Timestamp.from(java.time.Instant.now()),
+                    java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC")));
+            st.execute();
+        } catch (Exception e) { System.out.println("[CENTRAL][DB] spOpenSession("+sID+","+cpID+") ERROR: " + e.getMessage()); }
+    }
+
+    private void dbCloseSession (String sID, long tsMillis, String motivo, double kwh, double eur){
+        if (DB_URL==null || DB_URL.isBlank()) return;
+        try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+            var st = cn.prepareCall("{call dbo.spCloseSession(?,?,?,?,?)}")) {
+            st.setString(1, sID);
+            st.setTimestamp(2, new java.sql.Timestamp(tsMillis),
+                    java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC")));
+            st.setString(3, motivo);
+            st.setBigDecimal(4, java.math.BigDecimal.valueOf(kwh).setScale(6, java.math.RoundingMode.HALF_UP));
+            st.setBigDecimal(5, java.math.BigDecimal.valueOf(eur).setScale(4, java.math.RoundingMode.HALF_UP));
+            st.execute();
+        } catch (Exception e) {
+            System.out.println("[CENTRAL][DB] spCloseSession("+sID+") ERROR: " + e.getMessage());
+        }
+    }
+
+    private void dbRecoverOpenSessions() {
+        if (DB_URL==null || DB_URL.isBlank()) return;
+        try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+            var ps = cn.prepareStatement("""
+                SELECT s.session_id, s.cp_id, s.driver_id, s.price_eur_kwh, s.t_start
+                FROM dbo.[Session] s
+                WHERE s.t_end IS NULL
+            """);
+            var rs = ps.executeQuery()) {
+
+            int n=0;
+            while (rs.next()) {
+                String sesId  = rs.getString(1);
+                String cpID   = rs.getString(2).toUpperCase(java.util.Locale.ROOT);
+                String driver = rs.getString(3);
+
+                // reconstruye in-memory
+                var info = cps.computeIfAbsent(cpID, _ -> new CPInfo());
+                synchronized (info) {
+                    info.cpID   = cpID;
+                    info.estado = "ESPERANDO_PLUG"; // o "DESCONECTADO" si no hay HB aún
+                    info.ocupado= true;
+                }
+                var sInf = new SesionInfo(sesId, cpID, driver);
+                sesiones.put(sesId, sInf);
+                cpSesionesActivas.put(cpID, sesId);
+                n++;
+            }
+            System.out.println("[CENTRAL][RECOVERY] Sesiones abiertas rehidratadas: " + n);
+        } catch (Exception e) {
+            System.err.println("[CENTRAL][RECOVERY] ERROR: " + e.getMessage());
+        }
+    }
+  
+    // ============================================================
+    // Seguridad: AUTH_CP + claves + cifrado
+    // ============================================================
+    private AuthResult autenticarCpEnBd(String cpId, String secret, String remoteIp) {
+        // Si no hay BD configurada, aceptamos todo y solo generamos la clave
+        if (DB_URL == null || DB_URL.isBlank()) {
+            String key = getOrCreateCpKey(cpId);
+            audit("AUTH_CP_OK", "CP=" + cpId + " ip=" + remoteIp,
+                  "DB_URL vacía; clave generada=" + key);
+            return new AuthResult(true, key, null);
+        }
+
+        try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+             var ps = cn.prepareStatement(
+                     "SELECT secret, status FROM EV_CP_REGISTRY WHERE cp_id = ?")) {
+
+            ps.setString(1, cpId);
+            try (var rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    audit("AUTH_CP_FAIL", "CP=" + cpId + " ip=" + remoteIp,
+                          "reason=NOT_REGISTERED");
+                    return new AuthResult(false, null, "NOT_REGISTERED");
+                }
+
+                String dbSecret = rs.getString("secret");
+                String status   = rs.getString("status");
+
+                if (!"ACTIVO".equalsIgnoreCase(status)) {
+                    audit("AUTH_CP_FAIL", "CP=" + cpId + " ip=" + remoteIp,
+                          "reason=NOT_ACTIVE status=" + status);
+                    return new AuthResult(false, null, "NOT_ACTIVE");
+                }
+
+                if (!dbSecret.equals(secret)) {
+                    audit("AUTH_CP_FAIL", "CP=" + cpId + " ip=" + remoteIp,
+                          "reason=BAD_SECRET");
+                    return new AuthResult(false, null, "BAD_SECRET");
+                }
+            }
+
+            String key = getOrCreateCpKey(cpId);
+            audit("AUTH_CP_OK", "CP=" + cpId + " ip=" + remoteIp,
+                  "Clave asignada=" + key);
+            return new AuthResult(true, key, null);
+
+        } catch (Exception e) {
+            audit("AUTH_CP_ERROR", "CP=" + cpId + " ip=" + remoteIp,
+                  "reason=DB_ERROR msg=" + e.getMessage());
+            return new AuthResult(false, null, "DB_ERROR");
+        }
+    }
+
+    
     private String getOrCreateCpKey(String cpId) {
         return cpKeys.computeIfAbsent(cpId, id -> generarClaveSimetrica());
     }
@@ -1161,8 +1375,7 @@ public class EVCentral {
         return java.util.Base64.getEncoder().encodeToString(buf);
     }
 
-        // ---------- Cifrado simétrico AES/GCM para CPs ----------
-
+    
     private static String aesEncrypt(String plainText, String keyB64) throws Exception {
         byte[] keyBytes = Base64.getDecoder().decode(keyB64);
         SecretKeySpec key = new SecretKeySpec(keyBytes, "AES");
@@ -1201,8 +1414,8 @@ public class EVCentral {
         byte[] plainBytes = cipher.doFinal(cipherBytes);
         return new String(plainBytes, StandardCharsets.UTF_8);
     }
-
-    /**
+        // ---------- Cifrado simétrico AES/GCM para CPs ----------
+        /**
      * Envuelve un mensaje "interno" (CMD, etc.) para un CP en un sobre cifrado:
      * {
      *   "type":"ENC","src":"CENTRAL","cp":cpID,"ts":...,"payload":"base64(iv+cipher)"
@@ -1229,8 +1442,7 @@ public class EVCentral {
             return inner; // fallback
         }
     }
-
-    /**
+        /**
      * Descifra un mensaje "ENC" procedente de un CP.
      * Devuelve el JSON interno (CMD/TEL/SESSION_END) o null si algo falla.
      */
@@ -1255,8 +1467,9 @@ public class EVCentral {
         }
     }
 
-        // ====================== AUDITORÍA ======================
-
+    // ============================================================
+    // Seguridad: AUTH_CP + claves + cifrado
+    // ============================================================
     private static void audit(String action, String actor, String detail) {
         String ts = java.time.Instant.now().toString();
         String line = ts + " | " + action + " | " + actor + " | " + detail;
@@ -1277,6 +1490,27 @@ public class EVCentral {
             } catch (IOException e) {
                 System.err.println("[AUDIT] ERROR escribiendo: " + e.getMessage());
             }
+        }
+    }
+    
+    // ============================================================
+    // 12. Utilidades / helpers varios
+    // ============================================================
+    private static void clearConsole (){
+        try {
+            String os = System.getProperty("os.name", "").toLowerCase();
+            if (os.contains("win")) {                      
+            new ProcessBuilder("cmd", "/c", "cls")
+                .inheritIO()                              
+                .start().waitFor();
+            } 
+            else {                                      
+                System.out.print("\033[H\033[2J");
+                System.out.flush();
+            }
+        } catch (Exception e) {
+          
+            for (int i = 0; i < 60; i++) System.out.println();
         }
     }
 

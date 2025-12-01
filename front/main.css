@@ -1,0 +1,163 @@
+:root {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background:#f5f5f7;
+  color:#111;
+}
+
+body {
+  margin:0;
+  padding:16px;
+}
+
+header {
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  margin-bottom:16px;
+}
+
+h1 {
+  margin:0;
+  font-size:1.4rem;
+}
+
+.config-bar {
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  align-items:center;
+  margin-bottom:12px;
+}
+
+.config-bar input {
+  padding:4px 8px;
+  border-radius:6px;
+  border:1px solid #ccc;
+  min-width:260px;
+}
+
+.btn {
+  padding:6px 10px;
+  border-radius:6px;
+  border:1px solid #bbb;
+  background:#fff;
+  cursor:pointer;
+  font-size:0.9rem;
+}
+
+.btn:hover {
+  background:#f0f0f3;
+}
+
+.pill {
+  display:inline-block;
+  padding:2px 8px;
+  border-radius:999px;
+  font-size:0.8rem;
+  border:1px solid #ddd;
+}
+
+.pill-ok { background:#e8f7e8; }
+.pill-bad { background:#ffd6d6; }
+.pill-warn { background:#ffe9cc; }
+.pill-info { background:#e0ebff; }
+
+.grid {
+  display:grid;
+  grid-template-columns: minmax(0, 2.2fr) minmax(0, 1.8fr);
+  grid-auto-rows:minmax(0, auto);
+  gap:16px;
+}
+
+@media (max-width: 900px) {
+  .grid { grid-template-columns: 1fr; }
+}
+
+.card {
+  background:#fff;
+  border-radius:12px;
+  box-shadow:0 2px 6px rgba(0,0,0,0.06);
+  padding:12px 14px;
+  min-height:0;
+  display:flex;
+  flex-direction:column;
+}
+
+.card h2 {
+  margin:0 0 8px 0;
+  font-size:1.05rem;
+}
+
+.card-subtitle {
+  font-size:0.8rem;
+  color:#666;
+  margin-bottom:6px;
+}
+
+table {
+  width:100%;
+  border-collapse:collapse;
+  font-size:0.8rem;
+}
+
+th, td {
+  border-bottom:1px solid #eee;
+  padding:4px 6px;
+  text-align:left;
+}
+
+th {
+  background:#f6f7f9;
+  position:sticky;
+  top:0;
+  z-index:1;
+}
+
+tbody tr:nth-child(even) td {
+  background:#fafafa;
+}
+
+tbody tr.bad td { background:#ffe5e5; }
+tbody tr.warn td { background:#fff1d6; }
+tbody tr.info td { background:#e8f4ff; }
+tbody tr.ok td   { background:#e8f7e8; }
+
+.table-wrap {
+  overflow:auto;
+  flex:1 1 auto;
+  max-height:380px;
+}
+
+#status-line {
+  font-size:0.8rem;
+  color:#555;
+}
+
+#status-line span.label {
+  color:#999;
+}
+
+#error-line {
+  font-size:0.8rem;
+  color:#b00020;
+  min-height:1.1em;
+}
+
+ul.alerts {
+  list-style:none;
+  padding-left:0;
+  margin:6px 0 0 0;
+  font-size:0.8rem;
+}
+
+ul.alerts li {
+  margin-bottom:3px;
+}
+
+code {
+  font-family:Menlo,monospace;
+  font-size:0.8rem;
+  background:#f2f2f4;
+  padding:1px 4px;
+  border-radius:4px;
+}

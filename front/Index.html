@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>EVCharging Front — Central Monitor</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="main.css" />
+</head>
+<body>
+<header>
+  <h1>EVCharging Front — Monitor Central</h1>
+  <div>
+    <span id="evw-status" class="pill pill-info">EV_W: desconocido</span>
+  </div>
+</header>
+
+<div class="config-bar">
+  <span class="label">Central API:</span>
+  <input id="centralUrl" type="text" value="http://127.0.0.1:8080" />
+  <button class="btn" id="saveUrlBtn">Guardar</button>
+  <button class="btn" id="refreshBtn">Refrescar ahora</button>
+  <span id="status-line">
+    <span class="label">Última actualización:</span> <span id="lastRefresh">—</span>
+  </span>
+</div>
+<div id="error-line"></div>
+
+<div class="grid">
+  <!-- CPs ----------------------------------------------------- -->
+  <section class="card">
+    <h2>Charging Points (CPs)</h2>
+    <div class="card-subtitle">
+      Fuente: <code>GET /api/cps</code> (o <code>/api/status</code>) de EV_Central
+    </div>
+    <div class="table-wrap">
+      <table id="cps-table">
+        <thead>
+          <tr>
+            <th>CP</th>
+            <th>Estado</th>
+            <th>Parado</th>
+            <th>Ocupado</th>
+            <th>lastHB (ms)</th>
+            <th>Sesión</th>
+            <th>Driver</th>
+            <th>kWh</th>
+            <th>€</th>
+            <th>Precio</th>
+            <th>Temp (°C)</th>
+            <th>Clima</th>
+          </tr>
+        </thead>
+        <tbody id="cps-tbody">
+          <tr><td colspan="12">Cargando…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Sesiones ------------------------------------------------ -->
+  <section class="card">
+    <h2>Sesiones activas</h2>
+    <div class="card-subtitle">
+      Fuente: <code>GET /api/sessions</code>
+    </div>
+    <div class="table-wrap">
+      <table id="sessions-table">
+        <thead>
+          <tr>
+            <th>Sesión</th>
+            <th>CP</th>
+            <th>Driver</th>
+            <th>Inicio (UTC)</th>
+            <th>kWh</th>
+            <th>€</th>
+          </tr>
+        </thead>
+        <tbody id="sessions-tbody">
+          <tr><td colspan="6">Cargando…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Drivers + EV_W ------------------------------------------ -->
+  <section class="card">
+    <h2>Drivers &amp; EV_W</h2>
+    <div class="card-subtitle">
+      Drivers: <code>GET /api/drivers</code> — Clima: campos <code>weatherAlert</code>, <code>tempC</code> de <code>/api/cps</code>
+    </div>
+    <div class="table-wrap">
+      <table id="drivers-table">
+        <thead>
+          <tr>
+            <th>Driver</th>
+          </tr>
+        </thead>
+        <tbody id="drivers-tbody">
+          <tr><td>Cargando…</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div style="margin-top:8px;font-size:0.8rem;">
+      Estado EV_W según datos de temperatura recientes suministrados a Central.
+    </div>
+  </section>
+
+  <!-- Alertas ------------------------------------------------- -->
+  <section class="card">
+    <h2>Alertas / Eventos</h2>
+    <div class="card-subtitle">
+      Derivadas de estados de CP, clima (EV_W) y latidos.
+    </div>
+    <ul id="alerts-list" class="alerts">
+      <li>Sin alertas.</li>
+    </ul>
+  </section>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

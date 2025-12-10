@@ -6,6 +6,20 @@
     "configurations": [
         {
             "type": "java",
+            "name": "EV_W",
+            "request": "launch",
+            "mainClass": "ev_w.EV_W",
+            "projectName": "SD_EVCharging_f4490f20"
+        },
+        {
+            "type": "java",
+            "name": "EVRegistry",
+            "request": "launch",
+            "mainClass": "central.EVRegistry",
+            "projectName": "SD_EVCharging_f4490f20"
+        },
+        {
+            "type": "java",
             "name": "EVDriver",
             "request": "launch",
             "mainClass": "driver.EVDriver",

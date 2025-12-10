@@ -24,6 +24,7 @@ import common.bus.NoBus;
 import common.bus.KafkaBus;
 
 import java.security.SecureRandom;
+import java.sql.DriverManager;
 import java.util.Base64;
 import java.util.Arrays;
 
@@ -617,22 +618,25 @@ public class EVCentral {
             System.err.println("[CENTRAL][KAFKA] onCmd: " + e.getMessage());
         }
     }
-
+    
     private void onKafkaTelemetry(com.google.gson.JsonObject m) {
         try {
-            // --- Soportar mensajes cifrados desde el CP (envoltorio ENC) ---
-            if (m.has("type") && "ENC".equals(m.get("type").getAsString())) {
-                com.google.gson.JsonObject inner = decryptFromCp(m);
-                if (inner == null) return;      // no se ha podido descifrar
-                m = inner;                      // seguimos trabajando con el JSON interno
+            if (!m.has("type")) return;
+            String type = m.get("type").getAsString();
+
+            // Si viene cifrado desde el ENGINE
+            if ("ENC".equals(type)) {
+                var inner = decryptFromCp(m);  // usa secret/cp.key
+                if (inner == null) return;
+                m = inner;
+                if (!m.has("type")) return;
+                type = m.get("type").getAsString();
             }
 
-            // --- A partir de aquí es el mensaje TEL "normal" ---
-            if (!m.has("type") || !"TEL".equals(m.get("type").getAsString())) return;
+            if (!"TEL".equals(type)) return;
 
-            String ses  = m.get("session").getAsString();
-            String cpID = m.get("cp").getAsString()
-                            .toUpperCase(java.util.Locale.ROOT);
+            String ses = m.get("session").getAsString();
+            String cpID  = m.get("cp").getAsString().toUpperCase(java.util.Locale.ROOT);
 
             double kwh = m.get("kwh").getAsDouble();
             double eur = m.get("eur").getAsDouble();
@@ -644,54 +648,63 @@ public class EVCentral {
             }
 
             var info = cps.get(cpID);
-            if (info != null) {
-                synchronized (info) {
-                    if (!"SUMINISTRANDO".equals(info.estado)) {
-                        info.estado = "SUMINISTRANDO";
-                    }
-                }
+            if (info != null) synchronized (info) {
+                if (!"SUMINISTRANDO".equals(info.estado)) info.estado = "SUMINISTRANDO";
             }
 
         } catch (Exception e) {
             System.err.println("[CENTRAL][KAFKA] TEL: " + e.getMessage());
         }
     }
-
+    
     private void onKafkaSessions(com.google.gson.JsonObject m) {
         try {
-            // --- Soportar mensajes cifrados desde el CP (envoltorio ENC) ---
-            if (m.has("type") && "ENC".equals(m.get("type").getAsString())) {
-                com.google.gson.JsonObject inner = decryptFromCp(m);
-                if (inner == null) return;      // no se ha podido descifrar
-                m = inner;                      // seguimos con el JSON interno
+            if (!m.has("type")) return;
+            String type = m.get("type").getAsString();
+
+            // Si viene cifrado desde el ENGINE
+            if ("ENC".equals(type)) {
+                var inner = decryptFromCp(m); // usa secret/cp.key
+                if (inner == null) {
+                    System.err.println("[CENTRAL][KAFKA] SESSION_END ENC pero no se pudo descifrar");
+                    return;
+                }
+                m = inner;
+                if (!m.has("type")) return;
+                type = m.get("type").getAsString();
             }
 
-            // --- A partir de aquí es el SESSION_END "normal" ---
-            if (!m.has("type")) return;
-            if (!"SESSION_END".equals(m.get("type").getAsString())) return;
+            if (!"SESSION_END".equals(type)) return;
 
             String sesId = m.get("session").getAsString();
-            String cpID  = m.get("cp").getAsString();
-            if (cpID != null) {
-                cpID = cpID.toUpperCase(java.util.Locale.ROOT);
+
+            String cpID  = m.has("cp") ? m.get("cp").getAsString() : null;
+            if (cpID != null) cpID = cpID.toUpperCase(java.util.Locale.ROOT);
+
+            // si no viene cp, intentamos deducirlo de la sesión en memoria
+            if (cpID == null) {
+                var sInfAux = sesiones.get(sesId);
+                if (sInfAux != null) cpID = sInfAux.cpID;
             }
 
-            long tsEnd   = m.has("ts")     ? m.get("ts").getAsLong()      : System.currentTimeMillis();
-            double kwh   = m.has("kwh")    ? m.get("kwh").getAsDouble()   : 0.0;
-            double eur   = m.has("eur")    ? m.get("eur").getAsDouble()   : 0.0;
-            String reason= m.has("reason") ? m.get("reason").getAsString(): "OK";
+            long tsEnd = m.has("ts") ? m.get("ts").getAsLong() : System.currentTimeMillis();
+            double kwh   = m.has("kwh") ? m.get("kwh").getAsDouble() : 0.0;
+            double eur   = m.has("eur") ? m.get("eur").getAsDouble() : 0.0;
+            String reason= m.has("reason") ? m.get("reason").getAsString() : "OK";
+
+            System.out.printf("[CENTRAL][KAFKA] SESSION_END ses=%s cp=%s kwh=%.5f eur=%.4f reason=%s%n",
+                    sesId, cpID, kwh, eur, reason);
 
             boolean eraSTOP = stopSolicitado.remove(sesId);
-            if (eraSTOP && "OK".equals(reason)) {
-                reason = "STOP_REQUESTED";
-            }
+            if (eraSTOP && "OK".equals(reason)) reason = "STOP_REQUESTED";
 
+            // Borramos de estructuras en memoria
             sesiones.remove(sesId);
-            cpSesionesActivas.remove(cpID, sesId);
+            if (cpID != null) {
+                cpSesionesActivas.remove(cpID, sesId);
 
-            var info = cps.get(cpID);
-            if (info != null) {
-                synchronized (info) {
+                var info = cps.get(cpID);
+                if (info != null) synchronized (info) {
                     info.ocupado = false;
                     if (!info.parado && !"AVERIADO".equals(info.estado)) {
                         info.estado = "ACTIVADO";
@@ -701,8 +714,6 @@ public class EVCentral {
 
             try {
                 dbCloseSession(sesId, tsEnd, reason, kwh, eur);
-                audit("SESSION_END", "session=" + sesId + " cp=" + cpID, "reason=" + reason + " kwh=" + kwh + " eur=" + eur);
-
             } catch (Exception ignore) {}
 
         } catch (Exception e) {
@@ -717,6 +728,7 @@ public class EVCentral {
         try {
             String json = buildStatusJson();
             byte[] body = json.getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().add("Access-Control-Allow-Origin","*");
             ex.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
             ex.sendResponseHeaders(200, body.length);
             ex.getResponseBody().write(body);
@@ -819,6 +831,7 @@ public class EVCentral {
             }
             String json = buildStatusJson();
             byte[] body = json.getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().add("Access-Control-Allow-Origin","*");
             ex.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
             ex.sendResponseHeaders(200, body.length);
             ex.getResponseBody().write(body);
@@ -837,6 +850,7 @@ public class EVCentral {
             }
             String json = buildSessionsJson();
             byte[] body = json.getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().add("Access-Control-Allow-Origin","*");
             ex.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
             ex.sendResponseHeaders(200, body.length);
             ex.getResponseBody().write(body);
@@ -855,6 +869,7 @@ public class EVCentral {
             }
             String json = buildDriversJson();
             byte[] body = json.getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().add("Access-Control-Allow-Origin","*");
             ex.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
             ex.sendResponseHeaders(200, body.length);
             ex.getResponseBody().write(body);
@@ -935,6 +950,7 @@ public class EVCentral {
             }
 
             byte[] resp = "{\"ok\":true}".getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().add("Access-Control-Allow-Origin","*");
             ex.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
             ex.sendResponseHeaders(200, resp.length);
             ex.getResponseBody().write(resp);
@@ -1366,107 +1382,117 @@ public class EVCentral {
 
     
     private String getOrCreateCpKey(String cpId) {
-        return cpKeys.computeIfAbsent(cpId, id -> generarClaveSimetrica());
-    }
+        // 1) ¿ya la tengo en memoria?
+        String k = cpKeys.get(cpId);
+        if (k != null && !k.isBlank()) return k;
 
-    private String generarClaveSimetrica() {
-        byte[] buf = new byte[32]; // 256 bits
-        new java.security.SecureRandom().nextBytes(buf);
-        return java.util.Base64.getEncoder().encodeToString(buf);
-    }
+        if (DB_URL == null || DB_URL.isBlank()) {
+            System.err.println("[CENTRAL] getOrCreateCpKey sin BD para CP " + cpId);
+            return null;
+        }
 
-    
+        // 2) Leerla de la tabla EV_CP_REGISTRY -> columna secret
+        try (var cn = java.sql.DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+            var ps = cn.prepareStatement(
+                    "SELECT secret FROM dbo.EV_CP_REGISTRY WHERE cp_id = ?")) {
+
+            ps.setString(1, cpId);
+            try (var rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    k = rs.getString(1);
+                    if (k != null && !k.isBlank()) {
+                        cpKeys.put(cpId, k);
+                        return k;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("[CENTRAL][DB] getOrCreateCpKey(" + cpId + ") " + e.getMessage());
+        }
+
+        System.err.println("[CENTRAL] ERROR: no hay secret para CP " + cpId + " en EV_CP_REGISTRY");
+        return null;
+    }
+    // Helpers AES (mismo esquema que en ENGINE)
     private static String aesEncrypt(String plainText, String keyB64) throws Exception {
-        byte[] keyBytes = Base64.getDecoder().decode(keyB64);
-        SecretKeySpec key = new SecretKeySpec(keyBytes, "AES");
+        byte[] keyBytes = java.util.Base64.getDecoder().decode(keyB64);
+        javax.crypto.spec.SecretKeySpec key = new javax.crypto.spec.SecretKeySpec(keyBytes, "AES");
 
-        // IV de 96 bits recomendado para GCM
-        byte[] iv = new byte[12];
-        new SecureRandom().nextBytes(iv);
+        byte[] iv = new byte[12]; // 96 bits para GCM
+        new java.security.SecureRandom().nextBytes(iv);
 
-        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-        GCMParameterSpec spec = new GCMParameterSpec(128, iv);
-        cipher.init(Cipher.ENCRYPT_MODE, key, spec);
-        byte[] cipherText = cipher.doFinal(plainText.getBytes(StandardCharsets.UTF_8));
+        javax.crypto.Cipher cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding");
+        javax.crypto.spec.GCMParameterSpec spec = new javax.crypto.spec.GCMParameterSpec(128, iv);
+        cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, key, spec);
+        byte[] cipherText = cipher.doFinal(plainText.getBytes(java.nio.charset.StandardCharsets.UTF_8));
 
-        // empaquetamos IV + cipherText y lo codificamos en Base64
         byte[] out = new byte[iv.length + cipherText.length];
         System.arraycopy(iv, 0, out, 0, iv.length);
         System.arraycopy(cipherText, 0, out, iv.length, cipherText.length);
 
-        return Base64.getEncoder().encodeToString(out);
+        return java.util.Base64.getEncoder().encodeToString(out);
     }
 
     private static String aesDecrypt(String cipherB64, String keyB64) throws Exception {
-        byte[] all = Base64.getDecoder().decode(cipherB64);
+        byte[] all = java.util.Base64.getDecoder().decode(cipherB64);
         if (all.length < 13) throw new IllegalArgumentException("cipher too short");
 
-        byte[] iv          = Arrays.copyOfRange(all, 0, 12);
-        byte[] cipherBytes = Arrays.copyOfRange(all, 12, all.length);
+        byte[] iv          = java.util.Arrays.copyOfRange(all, 0, 12);
+        byte[] cipherBytes = java.util.Arrays.copyOfRange(all, 12, all.length);
 
-        byte[] keyBytes = Base64.getDecoder().decode(keyB64);
-        SecretKeySpec key = new SecretKeySpec(keyBytes, "AES");
+        byte[] keyBytes = java.util.Base64.getDecoder().decode(keyB64);
+        javax.crypto.spec.SecretKeySpec key = new javax.crypto.spec.SecretKeySpec(keyBytes, "AES");
 
-        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-        GCMParameterSpec spec = new GCMParameterSpec(128, iv);
-        cipher.init(Cipher.DECRYPT_MODE, key, spec);
+        javax.crypto.Cipher cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding");
+        javax.crypto.spec.GCMParameterSpec spec = new javax.crypto.spec.GCMParameterSpec(128, iv);
+        cipher.init(javax.crypto.Cipher.DECRYPT_MODE, key, spec);
 
         byte[] plainBytes = cipher.doFinal(cipherBytes);
-        return new String(plainBytes, StandardCharsets.UTF_8);
-    }
-        // ---------- Cifrado simétrico AES/GCM para CPs ----------
-        /**
-     * Envuelve un mensaje "interno" (CMD, etc.) para un CP en un sobre cifrado:
-     * {
-     *   "type":"ENC","src":"CENTRAL","cp":cpID,"ts":...,"payload":"base64(iv+cipher)"
-     * }
-     */
-    private com.google.gson.JsonObject encryptForCp(String cpID, com.google.gson.JsonObject inner) {
-        String key = cpKeys.get(cpID);
-        if (key == null) {
-            System.err.println("[CENTRAL][ENC] No hay clave para CP " + cpID + ". Enviando sin cifrar.");
-            return inner; // fallback: protocolo antiguo
-        }
+        return new String(plainBytes, java.nio.charset.StandardCharsets.UTF_8);
+    } 
+    // ---------- Cifrado simétrico AES/GCM para CPs ----------
+        
+    private com.google.gson.JsonObject encryptForCp(String cpId, com.google.gson.JsonObject inner) {
         try {
-            String cipherB64 = aesEncrypt(inner.toString(), key);
-            com.google.gson.JsonObject env = obj(
+            String keyB64 = getOrCreateCpKey(cpId);
+            if (keyB64 == null || keyB64.isBlank()) {
+                System.err.println("[CENTRAL][ENC] Sin clave para CP " + cpId + ", enviando sin cifrar.");
+                return inner; // o lanza error si prefieres
+            }
+            String cipherB64 = aesEncrypt(inner.toString(), keyB64);
+            return common.net.Wire.obj(
                     "type","ENC",
                     "src","CENTRAL",
                     "ts",System.currentTimeMillis(),
-                    "cp",cpID,
-                    "payload",cipherB64
+                    "cp",cpId,
+                    "payload", cipherB64
             );
-            return env;
         } catch (Exception e) {
-            System.err.println("[CENTRAL][ENC] Error cifrando para CP " + cpID + ": " + e.getMessage());
-            return inner; // fallback
-        }
-    }
-        /**
-     * Descifra un mensaje "ENC" procedente de un CP.
-     * Devuelve el JSON interno (CMD/TEL/SESSION_END) o null si algo falla.
-     */
-    private com.google.gson.JsonObject decryptFromCp(com.google.gson.JsonObject m) {
-        try {
-            if (!m.has("cp") || !m.has("payload")) {
-                System.err.println("[CENTRAL][DEC] Mensaje ENC sin cp/payload");
-                return null;
-            }
-            String cpID = m.get("cp").getAsString().toUpperCase(java.util.Locale.ROOT);
-            String key  = cpKeys.get(cpID);
-            if (key == null) {
-                System.err.println("[CENTRAL][DEC] No hay clave para CP " + cpID);
-                return null;
-            }
-            String cipherB64 = m.get("payload").getAsString();
-            String plainJson = aesDecrypt(cipherB64, key);
-            return JSON.parse(plainJson).getAsJsonObject();
-        } catch (Exception e) {
-            System.err.println("[CENTRAL][DEC] Error descifrando mensaje ENC: " + e.getMessage());
-            return null;
+            System.err.println("[CENTRAL][ENC] Error cifrando para CP " + cpId + ": " + e.getMessage());
+            return inner; // fallback en claro
         }
     }
 
+    private com.google.gson.JsonObject decryptFromCp(com.google.gson.JsonObject env) {
+        try {
+            if (!env.has("cp") || !env.has("payload")) {
+                System.err.println("[CENTRAL][DEC] Mensaje ENC sin cp/payload");
+                return null;
+            }
+            String cpId = env.get("cp").getAsString().toUpperCase(java.util.Locale.ROOT);
+            String keyB64 = getOrCreateCpKey(cpId);
+            if (keyB64 == null || keyB64.isBlank()) {
+                System.err.println("[CENTRAL][DEC] Sin clave para CP " + cpId);
+                return null;
+            }
+            String cipherB64 = env.get("payload").getAsString();
+            String plainJson = aesDecrypt(cipherB64, keyB64);
+            return com.google.gson.JsonParser.parseString(plainJson).getAsJsonObject();
+        } catch (Exception e) {
+            System.err.println("[CENTRAL][DEC] Error descifrando desde CP: " + e.getMessage());
+            return null;
+        }
+    }
     // ============================================================
     // Seguridad: AUTH_CP + claves + cifrado
     // ============================================================

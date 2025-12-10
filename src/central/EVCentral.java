@@ -33,6 +33,9 @@ import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
 import com.google.gson.JsonParser;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+
 import java.nio.file.StandardOpenOption;
 
 
@@ -44,6 +47,11 @@ public class EVCentral {
         volatile long lastHb = System.currentTimeMillis();
         volatile boolean ocupado = false;
         volatile boolean parado = false;
+
+        //NUEVO: info de clima
+        volatile Double tempC = null;
+        volatile boolean weatherAlert = false;
+        volatile long lastWeatherTs = 0L;
     }
     static class SesionInfo {
         final String sesionID, cpID, driverID;
@@ -569,14 +577,22 @@ public class EVCentral {
             synchronized (info) {
                 if (!"ACTIVADO".equals(info.estado)) {
                     authMsg = obj("type","AUTH","ts",System.currentTimeMillis(),
-                                "driver",driverId,"cp",cpID,"ok",false,"reason",info.estado,"src","CENTRAL");
+                      "driver",driverId,"cp",cpID,"ok",false,
+                      "reason",info.estado,"src","CENTRAL");
                 } else if (info.parado) {
                     authMsg = obj("type","AUTH","ts",System.currentTimeMillis(),
-                                "driver",driverId,"cp",cpID,"ok",false,"reason","PARADO","src","CENTRAL");
+                      "driver",driverId,"cp",cpID,"ok",false,
+                      "reason","PARADO","src","CENTRAL");
                     audit("REQ_START_FAIL", "DRV=" + driverId + " cp=" + cpID, "reason=PARADO");
+                } else if (info.weatherAlert) {
+                    authMsg = obj("type","AUTH","ts",System.currentTimeMillis(),
+                      "driver",driverId,"cp",cpID,"ok",false,
+                      "reason","WEATHER_ALERT","src","CENTRAL");
+                    audit("REQ_START_FAIL", "DRV=" + driverId + " cp=" + cpID, "reason=WEATHER_ALERT");
                 } else if (info.ocupado) {
                     authMsg = obj("type","AUTH","ts",System.currentTimeMillis(),
-                                "driver",driverId,"cp",cpID,"ok",false,"reason","OCUPADO","src","CENTRAL");
+                      "driver",driverId,"cp",cpID,"ok",false,
+                      "reason","OCUPADO","src","CENTRAL");
                     audit("REQ_START_FAIL", "DRV=" + driverId + " cp=" + cpID, "reason=OCUPADO");
                 } else {
                     sesId = "S-" + System.currentTimeMillis();
@@ -618,13 +634,13 @@ public class EVCentral {
             System.err.println("[CENTRAL][KAFKA] onCmd: " + e.getMessage());
         }
     }
-    
+
     private void onKafkaTelemetry(com.google.gson.JsonObject m) {
         try {
             if (!m.has("type")) return;
             String type = m.get("type").getAsString();
 
-            // Si viene cifrado desde el ENGINE
+            // Si viene cifrado desde el ENGINE / EV_W
             if ("ENC".equals(type)) {
                 var inner = decryptFromCp(m);  // usa secret/cp.key
                 if (inner == null) return;
@@ -633,30 +649,78 @@ public class EVCentral {
                 type = m.get("type").getAsString();
             }
 
-            if (!"TEL".equals(type)) return;
+            switch (type) {
+                case "TEL" -> {
+                    String ses = m.get("session").getAsString();
+                    String cpID  = m.get("cp").getAsString().toUpperCase(java.util.Locale.ROOT);
 
-            String ses = m.get("session").getAsString();
-            String cpID  = m.get("cp").getAsString().toUpperCase(java.util.Locale.ROOT);
+                    double kwh = m.get("kwh").getAsDouble();
+                    double eur = m.get("eur").getAsDouble();
 
-            double kwh = m.get("kwh").getAsDouble();
-            double eur = m.get("eur").getAsDouble();
+                    var sInf = sesiones.get(ses);
+                    if (sInf != null) {
+                        sInf.kWhAccumulado = kwh;
+                        sInf.eurAccumulado = eur;
+                    }
 
-            var sInf = sesiones.get(ses);
-            if (sInf != null) {
-                sInf.kWhAccumulado = kwh;
-                sInf.eurAccumulado = eur;
-            }
+                    var info = cps.get(cpID);
+                    if (info != null) synchronized (info) {
+                        if (!"SUMINISTRANDO".equals(info.estado)) info.estado = "SUMINISTRANDO";
+                    }
+                }
 
-            var info = cps.get(cpID);
-            if (info != null) synchronized (info) {
-                if (!"SUMINISTRANDO".equals(info.estado)) info.estado = "SUMINISTRANDO";
+                case "WEATHER" -> {
+                    String cpID  = m.get("cp").getAsString().toUpperCase(java.util.Locale.ROOT);
+                    double tempC = m.get("tempC").getAsDouble();
+                    boolean alert = m.get("alert").getAsBoolean();
+                    long ts = m.has("ts") ? m.get("ts").getAsLong() : System.currentTimeMillis();
+
+                    CPInfo info = cps.get(cpID);
+                    if (info == null) return;
+
+                    boolean wasAlert;
+                    boolean ocupadoAhora;
+                    synchronized (info) {
+                        wasAlert = info.weatherAlert;
+                        info.tempC = tempC;
+                        info.weatherAlert = alert;
+                        info.lastWeatherTs = ts;
+                        ocupadoAhora = info.ocupado;
+
+                        if (alert) {
+                            // visualmente marcamos como AVERIADO por meteo
+                            info.estado = "AVERIADO";
+                        } else {
+                            // si se despeja y no está parado/averiado por otra cosa
+                            if (!info.parado && !"AVERIADO".equals(info.estado) && !info.ocupado) {
+                                info.estado = "ACTIVADO";
+                            }
+                        }
+                    }
+
+                    System.out.printf("[CENTRAL][WEATHER] cp=%s temp=%.2f alert=%s%n",
+                            cpID, tempC, alert);
+
+                    // Si acaba de entrar en alerta y está suministrando -> STOP_SUPPLY automático
+                    if (alert && !wasAlert && ocupadoAhora) {
+                        String sesId = cpSesionesActivas.get(cpID);
+                        if (sesId != null) {
+                            markStopRequested(cpID);
+                            bus.publish(T_CMD, cpID,
+                                obj("type","CMD","src","CENTRAL","ts",System.currentTimeMillis(),
+                                    "cmd","STOP_SUPPLY","cp",cpID,"session",sesId,
+                                    "reason","WEATHER_ALERT"));
+                            System.out.println("[CENTRAL][WEATHER] STOP_SUPPLY por alerta meteo cp=" + cpID);
+                        }
+                    }
+                }
             }
 
         } catch (Exception e) {
-            System.err.println("[CENTRAL][KAFKA] TEL: " + e.getMessage());
+            System.err.println("[CENTRAL][KAFKA] TEL/WEATHER: " + e.getMessage());
         }
     }
-    
+
     private void onKafkaSessions(com.google.gson.JsonObject m) {
         try {
             if (!m.has("type")) return;
@@ -1037,60 +1101,80 @@ public class EVCentral {
         sb.append("]}");
         return sb.toString();
     }
-
+    
     private String buildStatusJson () {
         long now = System.currentTimeMillis();
-        var sb = new StringBuilder();
-        sb.append("{\"items\":[");
-        boolean first = true;
+
+        JsonArray items = new JsonArray();
+
         for (var e : cps.entrySet()) {
             String cpID = e.getKey();
             CPInfo info = e.getValue();
 
-            String estado; boolean ocupado; boolean parado; long last;
+            String estadoVisible;
+            boolean ocupado, parado;
+            long lastHb;
             double precio;
-            synchronized (info) {               // snapshot coherente
-                estado = info.estado;
-                ocupado = info.ocupado;
-                parado  = info.parado;
-                last    = info.lastHb;
-                precio  = info.precio;
+            Double tempC;
+            boolean weatherAlert;
+            long weatherTs;
+            String ubicacion;
+
+            // snapshot coherente bajo lock
+            synchronized (info) {
+                estadoVisible = estadoVisible(info);
+                ocupado       = info.ocupado;
+                parado        = info.parado;
+                lastHb        = info.lastHb;
+                precio        = info.precio;
+                tempC         = info.tempC;
+                weatherAlert  = info.weatherAlert;
+                weatherTs     = info.lastWeatherTs;
+                ubicacion     = info.ubicacion;
             }
 
-            String sesion = cpSesionesActivas.getOrDefault(cpID, "-");
-            var sInf = sesiones.get(sesion);
-            double kwh = (sInf != null) ? sInf.kWhAccumulado : 0.0;
-            double eur = (sInf != null) ? sInf.eurAccumulado : 0.0;
+            String sesionId = cpSesionesActivas.getOrDefault(cpID, "-");
+            var sInf = sesiones.get(sesionId);
 
-            long lag = now - last;
+            double kwh = 0.0, eur = 0.0;
+            String driverId = "";
+            if (sInf != null) {
+                kwh      = sInf.kWhAccumulado;
+                eur      = sInf.eurAccumulado;
+                driverId = sInf.driverID;
+            }
 
-            WeatherInfo w = cpWeather.get(cpID);
-            boolean wAlert = (w != null && w.alert);
-            double tempC   = (w != null ? w.tempC : Double.NaN);
+            long lag = now - lastHb;
 
-            if (!first) sb.append(',');
-            first = false;
-            sb.append("{")
-              .append("\"cp\":\"").append(cpID).append("\",")
-              .append("\"estado\":\"").append(estado).append("\",")
-              .append("\"parado\":").append(parado).append(',')
-              .append("\"ocupado\":").append(ocupado).append(',')
-              .append("\"lastHbMs\":").append(lag).append(',')
-              .append("\"precio\":").append(String.format(java.util.Locale.ROOT,"%.4f", precio)).append(',')
-              .append("\"sesion\":\"").append("-".equals(sesion) ? "" : sesion).append("\",")
-              .append("\"kwh\":").append(String.format(java.util.Locale.ROOT,"%.5f", kwh)).append(',')
-              .append("\"eur\":").append(String.format(java.util.Locale.ROOT,"%.4f", eur)).append(',')
-              .append("\"weatherAlert\":").append(wAlert).append(',')
-              .append("\"tempC\":");
-            if (Double.isNaN(tempC)) {
-                sb.append("null");
+            JsonObject o = new JsonObject();
+            o.addProperty("cp", cpID);
+            o.addProperty("loc", ubicacion != null ? ubicacion : "");
+            o.addProperty("estado", estadoVisible);
+            o.addProperty("parado", parado);
+            o.addProperty("ocupado", ocupado);
+            o.addProperty("lastHbMs", lag);
+            o.addProperty("precio", precio);
+
+            o.addProperty("sesion", "-".equals(sesionId) ? "" : sesionId);
+            o.addProperty("driver", driverId);
+            o.addProperty("kwh", kwh);
+            o.addProperty("eur", eur);
+
+            // clima
+            if (tempC != null) {
+                o.addProperty("tempC", tempC);
             } else {
-                sb.append(String.format(java.util.Locale.ROOT,"%.2f", tempC));
+                o.add("tempC", com.google.gson.JsonNull.INSTANCE);
             }
-            sb.append("}");
+            o.addProperty("weatherAlert", weatherAlert);
+            o.addProperty("weatherTs", weatherTs);
+
+            items.add(o);
         }
-        sb.append("]}");
-        return sb.toString();
+
+        JsonObject root = new JsonObject();
+        root.add("items", items);
+        return root.toString();
     }
 
     private String toHtml(String s){

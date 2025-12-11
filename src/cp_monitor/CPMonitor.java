@@ -37,13 +37,20 @@ public class CPMonitor {
         try (InputStream in = Files.newInputStream(Path.of(rutaConfig))) { p.load(in); }
 
         final String centralHost = p.getProperty("monitor.centralHost", "127.0.0.1");
-        final int    centralPort = getInt(p, "monitor.centralPort", 5000);
-        final String cpId        = p.getProperty("monitor.cpId", "CP-001");
-        final String ubic        = p.getProperty("monitor.ubicacion", "N/A");
+        final int centralPort    = getInt(p, "monitor.centralPort", 5000);
+
+        // cp.id / cp.location son ahora los canónicos.
+        // monitor.cpId / monitor.ubicacion quedan como fallback antiguo.
+        final String cpId        = p.getProperty("cp.id",
+                                    p.getProperty("monitor.cpId", "CP-001"));
+        final String ubic        = p.getProperty("cp.location",
+                                    p.getProperty("monitor.ubicacion", "N/A"));
+
         final double precio      = getDouble(p, "monitor.precio", 0.35);
 
         final String engineHost  = p.getProperty("monitor.engineHost", "127.0.0.1");
-        final int    enginePort  = getInt(p, "monitor.enginePort", 6100);
+        final int enginePort     = getInt(p, "monitor.enginePort", 6100);
+
 
         final String registryUrl =
                 p.getProperty("registry.url", "http://127.0.0.1:8081/api/registry/register");

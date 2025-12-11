@@ -23,7 +23,7 @@ import common.bus.EventBus;
 import common.bus.NoBus;
 import common.bus.KafkaBus;
 
-import java.security.SecureRandom;
+/*import java.security.SecureRandom;
 import java.sql.DriverManager;
 import java.util.Base64;
 import java.util.Arrays;
@@ -32,9 +32,10 @@ import javax.crypto.Cipher;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
+import com.google.gson.JsonObject;*/
 import com.google.gson.JsonParser;
 import com.google.gson.JsonArray;
-import com.google.gson.JsonObject;
+
 
 import java.nio.file.StandardOpenOption;
 
@@ -415,8 +416,18 @@ public class EVCentral {
 
                         info.lastHb = System.currentTimeMillis();
                         synchronized (info) {
-                            if (!ok) info.estado = "AVERIADO";
-                            else if (!info.parado) info.estado = "ACTIVADO";
+                            if (!ok) {
+                                // Averiado de salud/monitor
+                                info.estado = "AVERIADO";
+                            } else if (!info.parado && !info.weatherAlert) {
+                                // Solo lo pongo ACTIVADO si:
+                                // - está sano
+                                // - NO está parado manualmente
+                                // - NO hay alerta meteo
+                                info.estado = "ACTIVADO";
+                            }
+                            // Si hay weatherAlert = true, NO tocamos estado aquí
+                            // -> lo deja como AVERIADO (o lo que haya puesto WEATHER)
                         }
                     }
                     default -> System.out.println("[CENTRAL] Tipo JSON desconocido: " + type);
@@ -575,30 +586,62 @@ public class EVCentral {
             com.google.gson.JsonObject authMsg = null, startCmd = null, sessStart = null;
 
             synchronized (info) {
-                if (!"ACTIVADO".equals(info.estado)) {
-                    authMsg = obj("type","AUTH","ts",System.currentTimeMillis(),
-                      "driver",driverId,"cp",cpID,"ok",false,
-                      "reason",info.estado,"src","CENTRAL");
-                } else if (info.parado) {
-                    authMsg = obj("type","AUTH","ts",System.currentTimeMillis(),
-                      "driver",driverId,"cp",cpID,"ok",false,
-                      "reason","PARADO","src","CENTRAL");
-                    audit("REQ_START_FAIL", "DRV=" + driverId + " cp=" + cpID, "reason=PARADO");
-                } else if (info.weatherAlert) {
-                    authMsg = obj("type","AUTH","ts",System.currentTimeMillis(),
-                      "driver",driverId,"cp",cpID,"ok",false,
-                      "reason","WEATHER_ALERT","src","CENTRAL");
-                    audit("REQ_START_FAIL", "DRV=" + driverId + " cp=" + cpID, "reason=WEATHER_ALERT");
-                } else if (info.ocupado) {
-                    authMsg = obj("type","AUTH","ts",System.currentTimeMillis(),
-                      "driver",driverId,"cp",cpID,"ok",false,
-                      "reason","OCUPADO","src","CENTRAL");
-                    audit("REQ_START_FAIL", "DRV=" + driverId + " cp=" + cpID, "reason=OCUPADO");
-                } else {
-                    sesId = "S-" + System.currentTimeMillis();
+                long now = System.currentTimeMillis();
+
+                // 1) Clima: si hay alerta meteorológica, NO se permite nueva sesión
+                if (info.weatherAlert) {
+                    authMsg = obj("type","AUTH","ts",now,
+                                "driver",driverId,"cp",cpID,
+                                "ok",false,
+                                "reason","WEATHER_ALERT",
+                                "src","CENTRAL");
+                    audit("REQ_START_FAIL",
+                        "DRV=" + driverId + " cp=" + cpID,
+                        "reason=WEATHER_ALERT tempC=" + info.tempC);
+                }
+
+                // 2) Estado general del CP (DESCONECTADO, AVERIADO, etc.)
+                else if (!"ACTIVADO".equals(info.estado)) {
+                    authMsg = obj("type","AUTH","ts",now,
+                                "driver",driverId,"cp",cpID,
+                                "ok",false,
+                                "reason",info.estado,
+                                "src","CENTRAL");
+                    audit("REQ_START_FAIL",
+                        "DRV=" + driverId + " cp=" + cpID,
+                        "reason=" + info.estado);
+                }
+
+                // 3) Parado manualmente
+                else if (info.parado) {
+                    authMsg = obj("type","AUTH","ts",now,
+                                "driver",driverId,"cp",cpID,
+                                "ok",false,
+                                "reason","PARADO",
+                                "src","CENTRAL");
+                    audit("REQ_START_FAIL",
+                        "DRV=" + driverId + " cp=" + cpID,
+                        "reason=PARADO");
+                }
+
+                // 4) Ya ocupado
+                else if (info.ocupado) {
+                    authMsg = obj("type","AUTH","ts",now,
+                                "driver",driverId,"cp",cpID,
+                                "ok",false,
+                                "reason","OCUPADO",
+                                "src","CENTRAL");
+                    audit("REQ_START_FAIL",
+                        "DRV=" + driverId + " cp=" + cpID,
+                        "reason=OCUPADO");
+                }
+
+                // 5) OK -> crear sesión
+                else {
+                    sesId = "S-" + now;
                     price = info.precio;
                     info.ocupado = true;
-                    info.estado  = "ESPERANDO_PLUG"; // ← clave para la UX/flow
+                    info.estado  = "ESPERANDO_PLUG";
 
                     var sInf = new SesionInfo(sesId, cpID, driverId);
                     sesiones.put(sesId, sInf);
@@ -606,20 +649,33 @@ public class EVCentral {
 
                     try { dbOpenSession(sesId, cpID, driverId, price); } catch (Exception ignore) {}
 
-                    audit("REQ_START_OK", "DRV=" + driverId + " cp=" + cpID, "session=" + sesId + " price=" + price);
+                    audit("REQ_START_OK",
+                        "DRV=" + driverId + " cp=" + cpID,
+                        "session=" + sesId + " price=" + price);
 
+                    authMsg   = obj("type","AUTH","ts",now,
+                                    "driver",driverId,"cp",cpID,
+                                    "ok",true,
+                                    "session",sesId,
+                                    "price",price,
+                                    "src","CENTRAL");
 
-                    long now = System.currentTimeMillis();
-                    authMsg   = obj("type","AUTH","ts",now,"driver",driverId,"cp",cpID,
-                                    "ok",true,"session",sesId,"price",price,"src","CENTRAL");
+                    startCmd  = obj("type","CMD","ts",now,
+                                    "src","CENTRAL",
+                                    "cmd","START_SUPPLY",
+                                    "session",sesId,
+                                    "cp",cpID,
+                                    "price",price);
 
-                    startCmd  = obj("type","CMD","ts",now,"src","CENTRAL",
-                                    "cmd","START_SUPPLY","session",sesId,"cp",cpID,"price",price);
-
-                    sessStart = obj("type","SESSION_START","ts",now,"src","CENTRAL",
-                                    "session",sesId,"cp",cpID,"driver",driverId,"price",price);
+                    sessStart = obj("type","SESSION_START","ts",now,
+                                    "src","CENTRAL",
+                                    "session",sesId,
+                                    "cp",cpID,
+                                    "driver",driverId,
+                                    "price",price);
                 }
-            } // fin synchronized(info)
+            }
+            // fin synchronized(info)
 
             // 4) Publicaciones FUERA del lock
             if (authMsg != null) bus.publish(T_SESSIONS, driverId, authMsg);

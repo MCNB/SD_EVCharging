@@ -37,8 +37,9 @@ public class EV_W {
         }
 
         EventBus bus = KafkaBus.from(cfg);
-        System.out.println("[EV_W] centralUrl=" + centralUrl + " intervalo=" + intervalSec +
-                           "s topicTEL=" + T_TELEMETRY);
+        System.out.println("[EV_W][KAFKA] bootstrap=" +
+        cfg.getProperty("kafka.bootstrap","(missing)") + " busImpl=" + bus.getClass().getSimpleName());
+
 
         Thread loop = new Thread(() -> {
             JsonParser parser = new JsonParser();

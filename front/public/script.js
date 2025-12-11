@@ -1,248 +1,156 @@
-// ⬇️ Pon aquí la URL HTTP de tu EV_Central (puerto central.httpPort)
-const API_BASE_URL = 'http://127.0.0.1:8080';
+// URL base de EV_Central (HTTP)
+const API_BASE_URL = 'http://127.0.0.1:8080'; // <-- cambia IP/puerto si hace falta
 
-// Endpoints de la API de EV_Central
-// - cps:     /api/cps  (fallback a /api/status si no existe)
-// - drivers: /api/drivers
+// Endpoints de la API REST de Central
 const ENDPOINTS = {
     cps: '/api/cps',
-    cpsFallback: '/api/status',
-    drivers: '/api/drivers'
+    drivers: '/api/drivers',
+    alerts: '/api/alerts',
+    audit: '/api/audit'
 };
 
-// ---------- Utilidades de fetch / normalización -----------------
+/* ------------------ UTILIDADES DE FETCH ------------------ */
 
-// Normaliza respuestas {items:[...]} → [...] o deja tal cual si ya es array
-function normalizeItems(data) {
-    if (!data) return null;
-    if (Array.isArray(data)) return data;
-    if (Array.isArray(data.items)) return data.items;
-    return data;
-}
-
-// fetch genérico con posible endpoint de respaldo (fallback)
-async function fetchData(endpoint, fallback) {
+// Función genérica para obtener datos de la API
+async function fetchData(endpoint) {
     try {
-        const response = await fetch(`${API_BASE_URL}${endpoint}`, { cache: 'no-store' });
+        const response = await fetch(`${API_BASE_URL}${endpoint}`);
         if (!response.ok) {
-            if (fallback) {
-                console.warn(`[FRONT] Falló ${endpoint}, probando fallback ${fallback}`);
-                const r2 = await fetch(`${API_BASE_URL}${fallback}`, { cache: 'no-store' });
-                if (!r2.ok) throw new Error(`Error ${r2.status}: ${r2.statusText}`);
-                const d2 = await r2.json();
-                return normalizeItems(d2);
-            }
             throw new Error(`Error ${response.status}: ${response.statusText}`);
         }
-        const data = await response.json();
-        return normalizeItems(data);
+        return await response.json();
     } catch (error) {
         console.error(`Error obteniendo datos de ${endpoint}:`, error);
         return null;
     }
 }
 
-// Atajo para poner “No hay datos disponibles”
-function showNoData(containerId) {
-    const c = document.getElementById(containerId);
-    if (!c) return;
-    c.innerHTML = '<div class="card">No hay datos disponibles</div>';
+// Normaliza respuestas para que siempre tengamos un array
+function asArray(data, itemsField = 'items') {
+    if (!data) return [];
+    if (Array.isArray(data)) return data;
+    if (Array.isArray(data[itemsField])) return data[itemsField];
+    return [];
 }
 
-// ---------- Construcción de datos derivados (clima, alertas) -----
+/* ------------------ BUCLE PRINCIPAL ------------------ */
 
-// Deriva “datos de clima” a partir de la lista de CPs
+async function updateInterface() {
+    // --- CPs ---
+    const cpsRaw = await fetchData(ENDPOINTS.cps);
+    const cpsItems = asArray(cpsRaw, 'items');
+    updateSection('cps-list', cpsItems, renderCPCard);
+
+    // --- Drivers ---
+    const driversRaw = await fetchData(ENDPOINTS.drivers);
+    const driversItems = asArray(driversRaw, 'items');
+    updateSection('drivers-list', driversItems, renderDriverCard);
+
+    // --- Clima (derivado de los CPs) ---
+    const weatherItems = buildWeatherDataFromCps(cpsItems);
+    updateSection('weather-list', weatherItems, renderWeatherCard);
+
+    // --- Alertas ---
+    const alertsRaw = await fetchData(ENDPOINTS.alerts);
+    const alertsItems = asArray(alertsRaw, 'items');
+    updateSection('alerts-list', alertsItems, renderAlertCard);
+
+    // --- Auditoría ---
+    const auditRaw = await fetchData(ENDPOINTS.audit);
+    const auditItems = asArray(auditRaw, 'items');
+    updateSection('audit-log', auditItems, renderAuditLog);
+}
+
+// Rellena un contenedor con tarjetas generadas por renderFunction
+function updateSection(containerId, items, renderFunction) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    container.innerHTML = '';
+
+    if (!items || items.length === 0) {
+        container.innerHTML = '<div class="card">No hay datos disponibles</div>';
+        return;
+    }
+
+    items.forEach(item => {
+        try {
+            container.appendChild(renderFunction(item));
+        } catch (e) {
+            console.error(`Error renderizando elemento en ${containerId}:`, e, item);
+        }
+    });
+}
+
+/* ------------------ CLIMA A PARTIR DE LOS CPs ------------------ */
+
 function buildWeatherDataFromCps(cps) {
     const list = [];
     if (!Array.isArray(cps)) return list;
 
     cps.forEach(cp => {
-        // Intentamos encontrar temperatura y alerta según vuestra API
-        const rawTemp = cp.tempC ?? cp.temperature;
-        const temp = rawTemp != null ? Number(rawTemp) : NaN;
-        const hasTemp = !Number.isNaN(temp);
-        const weatherAlertFlag = cp.weatherAlert ?? (hasTemp && temp < 0);
+        // Estado tal y como viene de CENTRAL
+        const estado = (cp.estado || cp.status || '').toUpperCase();
 
-        if (!hasTemp && !weatherAlertFlag) {
-            // si no hay temperatura ni alerta, no lo mostramos
-            return;
-        }
+        // Solo queremos CP que no estén DESCONECTADOS
+        const cpEncendido = estado !== 'DESCONECTADO';
+        if (!cpEncendido) return;
+
+        const rawTemp = cp.tempC ?? cp.temperature;
+        const hasTemp = typeof rawTemp === 'number' && !Number.isNaN(rawTemp);
+
+        const alertFlag = !!(cp.weatherAlert ?? (hasTemp && rawTemp < 0));
+
+        // Si no hay ni temperatura ni alerta, no pintamos tarjeta
+        if (!hasTemp && !alertFlag) return;
 
         const city =
-            cp.location ||
             cp.loc ||
+            cp.location ||
             cp.ubicacion ||
             cp.cp ||
             cp.id ||
             'N/A';
 
-        const ts =
-            cp.lastWeatherTs || // si lo tenéis en la API
-            '';                 // si no, vacío
+        const tsMs = cp.weatherTs || cp.lastWeatherTs || cp.ts || null;
+        const tsStr = tsMs ? new Date(tsMs).toLocaleString('es-ES') : '';
 
         list.push({
+            cpId: cp.cp || cp.id || city,
             city,
-            temperature: hasTemp ? temp : null,
-            alert: !!weatherAlertFlag,
-            timestamp: ts || ''
+            temperature: hasTemp ? rawTemp : null,
+            alert: alertFlag,
+            timestamp: tsStr,
+            estado
         });
     });
 
     return list;
 }
 
-// Deriva “alertas” a partir de estados de CP y clima
-function buildAlertsFromCps(cps) {
-    const list = [];
-    if (!Array.isArray(cps)) return list;
-
-    const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
-
-    cps.forEach(cp => {
-        const cpId = cp.cp || cp.id || 'N/A';
-        const estado = (cp.estado || cp.status || '').toUpperCase();
-        const lag = typeof cp.lastHbMs === 'number' ? cp.lastHbMs : null;
-
-        const rawTemp = cp.tempC ?? cp.temperature;
-        const temp = rawTemp != null ? Number(rawTemp) : NaN;
-        const hasTemp = !Number.isNaN(temp);
-        const weatherAlertFlag = cp.weatherAlert ?? (hasTemp && temp < 0);
-
-        // Estados “fuertes”
-        if (estado === 'AVERIADO' || estado === 'DESCONECTADO') {
-            list.push({
-                timestamp: now,
-                type: 'CP_STATE',
-                source: cpId,
-                message: `Estado ${estado}`
-            });
-        } else if (estado === 'PARADO') {
-            list.push({
-                timestamp: now,
-                type: 'CP_STATE',
-                source: cpId,
-                message: 'CP parado'
-            });
-        }
-
-        // Latido retrasado
-        if (lag != null && lag > 5000 && estado !== 'DESCONECTADO') {
-            list.push({
-                timestamp: now,
-                type: 'HEARTBEAT',
-                source: cpId,
-                message: `Latido retrasado (${lag} ms)`
-            });
-        }
-
-        // Alerta de clima
-        if (weatherAlertFlag) {
-            list.push({
-                timestamp: now,
-                type: 'WEATHER',
-                source: cpId,
-                message: `Alerta de clima${hasTemp ? ` (T=${temp}°C)` : ''}`
-            });
-        }
-    });
-
-    return list;
-}
-
-// ---------- Actualizar secciones de la interfaz ------------------
-
-// Actualiza un contenedor con datos usando una función de renderizado
-function updateSection(containerId, data, renderFunction) {
-    const container = document.getElementById(containerId);
-    if (!container) return;
-
-    container.innerHTML = '';
-    if (Array.isArray(data) && data.length > 0) {
-        data.forEach(item => container.appendChild(renderFunction(item)));
-    } else if (typeof data === 'object' && data !== null) {
-        container.appendChild(renderFunction(data));
-    } else {
-        container.innerHTML = '<div class="card">No hay datos disponibles</div>';
-    }
-}
-
-// Función principal de refresco
-async function updateInterface() {
-    // 1) CPs (y a partir de ellos: clima + alertas)
-    const cpsData = await fetchData(ENDPOINTS.cps, ENDPOINTS.cpsFallback);
-    if (cpsData) {
-        updateSection('cps-list', cpsData, renderCPCard);
-
-        const weatherData = buildWeatherDataFromCps(cpsData);
-        updateSection('weather-list', weatherData, renderWeatherCard);
-
-        const alertsData = buildAlertsFromCps(cpsData);
-        updateSection('alerts-list', alertsData, renderAlertCard);
-    } else {
-        showNoData('cps-list');
-        showNoData('weather-list');
-        showNoData('alerts-list');
-    }
-
-    // 2) Drivers
-    const driversData = await fetchData(ENDPOINTS.drivers);
-    if (driversData) {
-        updateSection('drivers-list', driversData, renderDriverCard);
-    } else {
-        showNoData('drivers-list');
-    }
-
-    // 3) Auditoría (no tenemos /api/audit en esta implementación)
-    const auditContainer = document.getElementById('audit-log');
-    if (auditContainer) {
-        auditContainer.innerHTML =
-            '<div class="card">Funcionalidad de auditoría no disponible en esta instancia de EV_Central.</div>';
-    }
-}
-
-// ---------- Render de tarjetas ----------------------------------
+/* ------------------ RENDERIZADO DE TARJETAS ------------------ */
 
 function renderCPCard(cp) {
     const div = document.createElement('div');
     div.className = 'card';
 
-    const id =
-        cp.id ||
-        cp.cp ||
-        cp.cpID ||
-        'N/A';
-
-    const location =
-        cp.location ||
-        cp.loc ||
-        cp.ubicacion ||
-        'N/A';
-
-    const status =
-        cp.status ||
-        cp.estado ||
-        'N/A';
-
+    const id = cp.cp || cp.id || 'N/A';
+    const loc = cp.loc || cp.location || cp.ubicacion || 'N/A';
+    const estado = cp.estado || cp.status || 'N/A';
     const sesion = cp.sesion || cp.session || '';
-    const kwh = cp.kwh != null ? cp.kwh : '';
-    const eur = cp.eur != null ? cp.eur : '';
-    const precio = cp.precio != null ? cp.precio : '';
-
-    const registeredFlag = cp.registered;
-    const registeredText =
-        registeredFlag === undefined ? 'N/A' : (registeredFlag ? 'Sí' : 'No');
-
-    const token = cp.token || cp.key_b64 || 'N/A';
+    const driver = cp.driver || '';
+    const precio = (cp.precio != null) ? Number(cp.precio).toFixed(4) : 'N/A';
+    const kwh = (cp.kwh != null) ? Number(cp.kwh).toFixed(5) : 0;
+    const eur = (cp.eur != null) ? Number(cp.eur).toFixed(4) : 0;
 
     div.innerHTML = `
         <strong>ID:</strong> ${id}<br>
-        <strong>Ubicación:</strong> ${location}<br>
-        <strong>Estado:</strong> ${status}<br>
+        <strong>Ubicación:</strong> ${loc}<br>
+        <strong>Estado:</strong> ${estado}<br>
         <strong>Sesión:</strong> ${sesion || '—'}<br>
-        <strong>kWh / €:</strong> ${kwh || '0'} / ${eur || '0'}<br>
-        <strong>Precio:</strong> ${precio || 'N/A'} €/kWh<br>
-        <strong>Registrado:</strong> ${registeredText}<br>
-        <strong>Token:</strong> ${token}
+        <strong>kWh / €:</strong> ${kwh} / ${eur}<br>
+        <strong>Precio:</strong> ${precio} €/kWh<br>
+        <strong>Driver:</strong> ${driver || 'N/A'}<br>
     `;
     return div;
 }
@@ -251,16 +159,16 @@ function renderDriverCard(driver) {
     const div = document.createElement('div');
     div.className = 'card';
 
-    const id = driver.id || driver.driver || 'N/A';
-    const vehicle = driver.vehicle || 'N/A';
-    const status = driver.status || 'N/A';
-    const assignedCp = driver.assignedCp || driver.cp || 'Ninguno';
+    const id = driver.id || driver.driver || driver.driverId || 'N/A';
+    const veh = driver.vehicle || driver.matricula || 'N/A';
+    const estado = driver.status || driver.estado || 'N/A';
+    const cpAsignado = driver.cp || driver.cpId || driver.assignedCp || 'Ninguno';
 
     div.innerHTML = `
         <strong>ID:</strong> ${id}<br>
-        <strong>Vehículo:</strong> ${vehicle}<br>
-        <strong>Estado:</strong> ${status}<br>
-        <strong>CP asignado:</strong> ${assignedCp}
+        <strong>Vehículo:</strong> ${veh}<br>
+        <strong>Estado:</strong> ${estado}<br>
+        <strong>CP asignado:</strong> ${cpAsignado || 'Ninguno'}
     `;
     return div;
 }
@@ -268,18 +176,17 @@ function renderDriverCard(driver) {
 function renderWeatherCard(weather) {
     const div = document.createElement('div');
     div.className = 'card weather-card';
+    if (weather.alert) div.classList.add('alert-card');
 
-    const alertClass = weather.alert ? 'alert-card' : '';
-    if (alertClass) div.classList.add(alertClass);
-
-    const tempText =
+    const tempStr =
         weather.temperature == null || Number.isNaN(weather.temperature)
             ? 'N/A'
-            : `${weather.temperature} °C`;
+            : `${weather.temperature.toFixed(1)} °C`;
 
     div.innerHTML = `
-        <strong>Ciudad/CP:</strong> ${weather.city}<br>
-        <strong>Temperatura:</strong> ${tempText}<br>
+        <strong>Ciudad/CP:</strong> ${weather.city || weather.cpId || 'N/A'}<br>
+        <strong>Estado CP:</strong> ${weather.estado || 'N/A'}<br>
+        <strong>Temperatura:</strong> ${tempStr}<br>
         <strong>Alerta:</strong> ${weather.alert ? 'ACTIVA (T < 0°C)' : 'No'}<br>
         <strong>Última actualización:</strong> ${weather.timestamp || ''}
     `;
@@ -289,11 +196,21 @@ function renderWeatherCard(weather) {
 function renderAlertCard(alert) {
     const div = document.createElement('div');
     div.className = 'card alert-card';
+
+    const ts = alert.ts || alert.timestamp || '';
+    const tipo = alert.type || alert.eventType || 'N/A';
+    const src = alert.src || alert.source || 'N/A';
+    const msg = alert.msg || alert.message || alert.detail || '';
+
+    const tsStr = ts
+        ? new Date(ts).toLocaleString('es-ES')
+        : (alert.timestampStr || '');
+
     div.innerHTML = `
-        <strong>${alert.timestamp}</strong><br>
-        <strong>Tipo:</strong> ${alert.type}<br>
-        <strong>Origen:</strong> ${alert.source}<br>
-        <strong>Mensaje:</strong> ${alert.message}
+        <strong>${tsStr}</strong><br>
+        <strong>Tipo:</strong> ${tipo}<br>
+        <strong>Origen:</strong> ${src}<br>
+        <strong>Mensaje:</strong> ${msg}
     `;
     return div;
 }
@@ -301,19 +218,24 @@ function renderAlertCard(alert) {
 function renderAuditLog(log) {
     const div = document.createElement('div');
     div.className = 'card';
+
+    const ts = log.ts || log.timestamp || '';
+    const tsStr = ts
+        ? new Date(ts).toLocaleString('es-ES')
+        : (log.timestampStr || '');
+
     div.innerHTML = `
-        <strong>Fecha/Hora:</strong> ${log.timestamp}<br>
-        <strong>IP Origen:</strong> ${log.sourceIp}<br>
-        <strong>Acción:</strong> ${log.action}<br>
-        <strong>Detalles:</strong> ${log.details}
+        <strong>Fecha/Hora:</strong> ${tsStr}<br>
+        <strong>IP Origen:</strong> ${log.sourceIp || log.ip || 'N/A'}<br>
+        <strong>Acción:</strong> ${log.action || log.event || 'N/A'}<br>
+        <strong>Detalles:</strong> ${log.details || log.detail || ''}
     `;
     return div;
 }
 
-// ---------- Bucle de refresco -----------------------------------
-
-// Actualizar la interfaz cada 5 segundos
-setInterval(updateInterface, 5000);
+/* ------------------ ARRANQUE PERIÓDICO ------------------ */
 
 // Carga inicial
 updateInterface();
+// Refresco cada 5 segundos
+setInterval(updateInterface, 5000);

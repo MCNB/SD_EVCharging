@@ -12,7 +12,7 @@ import java.net.HttpURLConnection;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.URL;
-import java.net.InetSocketAddress;
+//import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -51,13 +51,12 @@ public class CPMonitor {
         final String engineHost  = p.getProperty("monitor.engineHost", "127.0.0.1");
         final int enginePort     = getInt(p, "monitor.enginePort", 6100);
 
-
         final String registryUrl =
                 p.getProperty("registry.url", "http://127.0.0.1:8081/api/registry/register");
         final String secretFile =
                 p.getProperty("registry.secret.file", "config/registry.secret");
         final String keyFile =
-                p.getProperty("auth.key.file", "config/cp.key");
+                p.getProperty("auth.key.file", "config/cp.key");   // <- ahora mismo aquí no lo estás usando en main
 
         System.out.printf("[MON] cfg central=%s:%d cp=%s ubic=%s precio=%.2f engine=%s:%d%n",
                 centralHost, centralPort, cpId, ubic, precio, engineHost, enginePort);
@@ -75,59 +74,34 @@ public class CPMonitor {
         // --- Bucle de siempre hablando con CENTRAL (ahora con AUTH_CP al principio) ---
         for (;;) {
             try (Socket sC = new Socket(centralHost, centralPort);
-                 DataInputStream  inC  = new DataInputStream(sC.getInputStream());
-                 DataOutputStream outC = new DataOutputStream(sC.getOutputStream())) {
+                DataInputStream  inC  = new DataInputStream(sC.getInputStream());
+                DataOutputStream outC = new DataOutputStream(sC.getOutputStream())) {
+
+                // 1) Durante AUTH_CP, damos más margen (2 segundos)
+                sC.setSoTimeout(2000);
 
                 System.out.println("[MON] Conectado a CENTRAL " + centralHost + ":" + centralPort);
 
-                // Timeout más largo para la fase de autenticación
-                sC.setSoTimeout(2000);
+                // IMPORTANTE: aquí debes tener definida autenticarCpEnCentral(inC, outC, cpId, cpSecret)
+                autenticarCpEnCentral(inC, outC, cpId, cpSecret);
 
-                // PASO 2: Autenticación en CENTRAL (AUTH_CP) y obtención de la clave simétrica
-                String cpKey = autenticarEnCentral(cpId, cpSecret, inC, outC, keyFile);
-
-                System.out.println("[MON] Autenticación OK. Clave simétrica=" + cpKey);
-
-                // Después de la autenticación ya podemos volver a un timeout corto para drainAcks
+                // 2) Para el resto (drenar ACKs), volvemos a 200 ms
                 sC.setSoTimeout(200);
 
-                // REG_CP (JSON vía Wire) - como en Release 1
+                // 3) REG_CP + HBs como tenías
                 send(outC, obj("type","REG_CP","ts",System.currentTimeMillis(),
-                               "cp",cpId,"loc",ubic,"price",precio));
-                // Drena ACK (si Central lo envía)
-                drainAcks(inC, /*maxFrames*/ 2, /*label*/ "REG_CP");
+                            "cp",cpId,"loc",ubic,"price",precio));
+                drainAcks(inC, 2, "REG_CP");
 
                 long lastHb = 0L;
-
                 while (true) {
                     long now = System.currentTimeMillis();
-                    if (now - lastHb >= 1000) { // <-- 1 HB por segundo
-                        boolean ok;
-                        try {
-                            InetSocketAddress addr = new InetSocketAddress(engineHost, enginePort);
-                            try (Socket sEngine = new Socket()) {
-                                sEngine.connect(addr, /*connect-timeout ms*/ 200);
-                                sEngine.setSoTimeout(/*read-timeout ms*/ 200);
-
-                                try (DataInputStream  inEngine  = new DataInputStream(sEngine.getInputStream());
-                                     DataOutputStream outEngine = new DataOutputStream(sEngine.getOutputStream())) {
-                                    outEngine.writeUTF("PING");
-                                    ok = "OK".equalsIgnoreCase(inEngine.readUTF());
-                                }
-                            }
-                        } catch (Exception e) {
-                            ok = false; // si falla o expira: reporta KO pero NO bloquea el HB
-                        }
-
-                        // Enviar siempre el HB (aunque el health haya sido KO o haya expirado)
-                        send(outC, obj("type","HB","ts",now,"cp",cpId,"ok",ok));
+                    if (now - lastHb >= 1000) {
+                        boolean okEngine = pingEngine(engineHost, enginePort);
+                        send(outC, obj("type","HB","ts",now,"cp",cpId,"ok",okEngine));
                         lastHb = now;
-
-                        // Drenar ACK(s) si los hubiera (opcional)
-                        drainAcks(inC, /*maxFrames*/ 2, "HB");
+                        drainAcks(inC, 2, "HB");
                     }
-
-                    // Evita busy-loop
                     Thread.sleep(50);
                 }
 
@@ -139,47 +113,45 @@ public class CPMonitor {
     }
 
     // ------------------- AUTH_CP hacia CENTRAL -------------------
+    private static void autenticarCpEnCentral(DataInputStream inC,
+                                            DataOutputStream outC,
+                                            String cpId,
+                                            String cpSecret) {
+        try {
+            System.out.println("[MON] Autenticando CP en CENTRAL. cp=" + cpId);
 
-    /**
-     * Envía AUTH_CP con {cp,secret} y espera AUTH_OK/AUTH_ERR.
-     * Si es OK, guarda la clave simétrica en keyFile y la devuelve.
-     */
-    private static String autenticarEnCentral(String cpId,
-                                              String cpSecret,
-                                              DataInputStream inC,
-                                              DataOutputStream outC,
-                                              String keyFile) throws Exception {
-        System.out.println("[MON] Autenticando CP en CENTRAL. cp=" + cpId);
+            send(outC, obj(
+                    "type","AUTH_CP",
+                    "ts",System.currentTimeMillis(),
+                    "cp",cpId,
+                    "secret",cpSecret   // <-- esto es lo que Central está esperando
+            ));
 
-        // Enviar AUTH_CP
-        send(outC, obj("type","AUTH_CP",
-                       "ts",System.currentTimeMillis(),
-                       "cp",cpId,
-                       "secret",cpSecret));
+            // Respuesta opcional
+            drainAcks(inC, 1, "AUTH_CP");
 
-        // Esperar respuesta
-        Object frame = recv(inC);   // Wire.recv devuelve normalmente un JsonObject (Gson)
-        JsonObject resp = (JsonObject) frame;
+        } catch (Exception e) {
+            System.out.println("[MON] Error autenticando CP en CENTRAL: " + e.getMessage());
+        }
+    }
+    
+    private static boolean pingEngine(String engineHost, int enginePort) {
+        try {
+            var addr = new java.net.InetSocketAddress(engineHost, enginePort);
+            try (Socket sEngine = new Socket()) {
+                sEngine.connect(addr, 200);
+                sEngine.setSoTimeout(200);
 
-        String type = resp.get("type").getAsString();
-        if ("AUTH_OK".equals(type)) {
-            String key = resp.get("key").getAsString();
-            System.out.println("[MON] AUTH_OK recibido. key=" + key);
+                try (DataInputStream inEngine  = new DataInputStream(sEngine.getInputStream());
+                    DataOutputStream outEngine = new DataOutputStream(sEngine.getOutputStream())) {
 
-            // Guardar la clave simétrica para que la use el Engine
-            Path f = Path.of(keyFile);
-            if (f.getParent() != null) {
-                Files.createDirectories(f.getParent());
+                    outEngine.writeUTF("PING");
+                    String resp = inEngine.readUTF();
+                    return "OK".equalsIgnoreCase(resp);
+                }
             }
-            Files.writeString(f, key.trim(), StandardCharsets.UTF_8);
-            System.out.println("[MON] Clave simétrica guardada en " + f.toAbsolutePath());
-
-            return key;
-        } else if ("AUTH_ERR".equals(type)) {
-            String reason = resp.has("reason") ? resp.get("reason").getAsString() : "desconocido";
-            throw new RuntimeException("AUTH_ERR desde CENTRAL: " + reason);
-        } else {
-            throw new RuntimeException("Respuesta inesperada en AUTH_CP: type=" + type);
+        } catch (Exception e) {
+            return false;
         }
     }
 
@@ -254,19 +226,18 @@ public class CPMonitor {
 
     private static String leerSecret(String secretFile) {
         try {
-            Path f = Path.of(secretFile);
-            if (!Files.exists(f)) {
-                System.err.println("[MON] Fichero de secret no existe: " + f.toAbsolutePath());
+            var path = Path.of(secretFile);
+            if (!Files.exists(path)) {
+                System.out.println("[MON] Fichero de secret no existe: " + path.toAbsolutePath());
                 return null;
             }
-            String s = Files.readString(f, StandardCharsets.UTF_8).trim();
-            System.out.println("[MON] Secret leído de " + f.toAbsolutePath());
-            return s;
+            return Files.readString(path, java.nio.charset.StandardCharsets.UTF_8).trim();
         } catch (Exception e) {
-            System.err.println("[MON] Error leyendo secret: " + e.getMessage());
+            System.out.println("[MON] Error leyendo secret: " + e.getMessage());
             return null;
         }
     }
+
 
     /**
      * Intenta leer y descartar hasta 'max' frames con timeout corto (SO_TIMEOUT del socket).

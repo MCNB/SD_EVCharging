@@ -325,89 +325,102 @@ public class EVCentral {
     // Conexión TCP con CPMonitor
     // ============================================================
     private void atender(Socket s) {
-        String cliente = s.getRemoteSocketAddress().toString();
+        String cliente  = s.getRemoteSocketAddress().toString();
         String remoteIp = s.getInetAddress().getHostAddress();
         System.out.println("[CENTRAL] Conexión " + cliente);
 
-        try (DataInputStream in = new DataInputStream(s.getInputStream());
-             DataOutputStream out = new DataOutputStream(s.getOutputStream())) {
+        try (DataInputStream in  = new DataInputStream(s.getInputStream());
+            DataOutputStream out = new DataOutputStream(s.getOutputStream())) {
 
-            boolean authenticated = false;
-            String cpIdAutenticado = null;
+            boolean authenticated   = false;
+            String  cpIdAutenticado = null;
 
             while (true) {
                 JsonObject msg = recv(in);
                 String type = msg.has("type") ? msg.get("type").getAsString() : null;
                 if (type == null) continue;
 
-                // --- FASE DE AUTENTICACIÓN ---
+                // --------- FASE DE AUTENTICACIÓN ---------
                 if (!authenticated) {
-                    if ("AUTH_CP".equals(type)) {
-                        String cpID   = msg.get("cp").getAsString();
-                        String secret = msg.get("secret").getAsString();
-
-                        if (cpID != null) {
-                            cpID = cpID.toUpperCase(java.util.Locale.ROOT);
-                        }
-
-                        AuthResult ar = autenticarCpEnBd(cpID, secret, remoteIp);
-                        if (ar.ok) {
-                            // Enviamos AUTH_OK con la clave simétrica
-                            send(out, obj("type","AUTH_OK",
-                                          "ts",System.currentTimeMillis(),
-                                          "cp",cpID,
-                                          "key",ar.key));
-                            authenticated = true;
-                            cpIdAutenticado = cpID;
-                            System.out.println("[CENTRAL] CP autenticado: " + cpID);
-                        } else {
-                            // Enviamos AUTH_ERR y cerramos conexión
-                            send(out, obj("type","AUTH_ERR",
-                                          "ts",System.currentTimeMillis(),
-                                          "cp",cpID,
-                                          "reason",ar.reason));
-                            System.out.println("[CENTRAL] AUTH_CP rechazada para " + cpID +
-                                               " reason=" + ar.reason);
-                            break;
-                        }
-                    } else {
-                        // Cualquier cosa que no sea AUTH_CP antes de autenticarse => error
+                    if (!"AUTH_CP".equals(type)) {
+                        // Cualquier cosa antes de AUTH_CP => error
                         send(out, obj("type","AUTH_ERR",
-                                      "ts",System.currentTimeMillis(),
-                                      "cp","?",
-                                      "reason","MISSING_AUTH"));
+                                    "ts",System.currentTimeMillis(),
+                                    "cp","?",
+                                    "reason","MISSING_AUTH"));
                         System.out.println("[CENTRAL] Recibido " + type +
-                                           " antes de AUTH_CP. Cerrando conexión " + cliente);
+                                        " antes de AUTH_CP. Cerrando conexión " + cliente);
                         break;
                     }
-                    continue; // seguimos al siguiente frame
-                }
 
-                // --- A PARTIR DE AQUÍ EL CP YA ESTÁ AUTENTICADO ---
-
-                switch (type) {
-                    // -------- Monitor: alta CP --------
-                    case "REG_CP" -> {
-                        String cpID = msg.get("cp").getAsString();
-                        String loc  = msg.get("loc").getAsString();
-                        double price= msg.get("price").getAsDouble();
-
-                        // Normalizamos CP en mayúsculas
-                        if (cpID != null) {
+                    // Parseo robusto de AUTH_CP
+                    String cpID   = null;
+                    String secret = null;
+                    try {
+                        if (msg.has("cp") && !msg.get("cp").isJsonNull()) {
+                            cpID = msg.get("cp").getAsString();
                             cpID = cpID.toUpperCase(java.util.Locale.ROOT);
                         }
+                        if (msg.has("secret") && !msg.get("secret").isJsonNull()) {
+                            secret = msg.get("secret").getAsString();
+                        }
+                    } catch (Exception ex) {
+                        System.out.println("[CENTRAL] AUTH_CP mal formado desde " +
+                                cliente + ": " + msg + " err=" + ex.getMessage());
+                    }
+
+                    if (cpID == null || secret == null || secret.isBlank()) {
+                        // No tiramos NPE: devolvemos AUTH_ERR y cerramos
+                        send(out, obj("type","AUTH_ERR",
+                                    "ts",System.currentTimeMillis(),
+                                    "cp", cpID != null ? cpID : "?",
+                                    "reason","MALFORMED_AUTH_CP"));
+                        System.out.println("[CENTRAL] AUTH_CP sin cp/secret válido desde " +
+                                cliente + ": " + msg);
+                        break;
+                    }
+
+                    // Autenticación contra BD / EV_CP_REGISTRY
+                    AuthResult ar = autenticarCpEnBd(cpID, secret, remoteIp);
+
+                    if (ar.ok) {
+                        send(out, obj("type","AUTH_OK",
+                                    "ts",System.currentTimeMillis(),
+                                    "cp",cpID,
+                                    "key",ar.key));
+                        authenticated   = true;
+                        cpIdAutenticado = cpID;
+                        System.out.println("[CENTRAL] CP autenticado: " + cpID);
+                    } else {
+                        send(out, obj("type","AUTH_ERR",
+                                    "ts",System.currentTimeMillis(),
+                                    "cp",cpID,
+                                    "reason",ar.reason));
+                        System.out.println("[CENTRAL] AUTH_CP rechazada para " + cpID +
+                                        " reason=" + ar.reason);
+                        break;
+                    }
+                    continue; // siguiente frame una vez autenticado
+                }
+
+                // --------- A PARTIR DE AQUÍ YA ESTÁ AUTENTICADO ---------
+
+                switch (type) {
+                    case "REG_CP" -> {
+                        String cpID = msg.get("cp").getAsString();
+                        if (cpID != null) cpID = cpID.toUpperCase(java.util.Locale.ROOT);
 
                         CPInfo info = cps.computeIfAbsent(cpID, _ -> new CPInfo());
                         synchronized (info) {
-                            info.cpID = cpID;
-                            info.ubicacion = loc;
-                            info.precio = price;
-                            info.estado = "ACTIVADO";
-                            info.lastHb = System.currentTimeMillis();
+                            info.cpID      = cpID;
+                            info.ubicacion = msg.get("loc").getAsString();
+                            info.precio    = msg.get("price").getAsDouble();
+                            info.estado    = "ACTIVADO";
+                            info.lastHb    = System.currentTimeMillis();
                         }
-                        try { dbUpsertCP(cpID, loc, price); } catch (Exception ignore) {}
+                        try { dbUpsertCP(cpID, info.ubicacion, info.precio); } catch (Exception ignore) {}
                     }
-                    // -------- Monitor: heartbeat --------
+
                     case "HB" -> {
                         String cpID = msg.get("cp").getAsString().toUpperCase(java.util.Locale.ROOT);
                         boolean ok  = msg.get("ok").getAsBoolean();
@@ -417,26 +430,18 @@ public class EVCentral {
                         info.lastHb = System.currentTimeMillis();
                         synchronized (info) {
                             if (!ok) {
-                                // Averiado de salud/monitor
                                 info.estado = "AVERIADO";
                             } else if (!info.parado && !info.weatherAlert) {
-                                // Solo lo pongo ACTIVADO si:
-                                // - está sano
-                                // - NO está parado manualmente
-                                // - NO hay alerta meteo
                                 info.estado = "ACTIVADO";
                             }
-                            // Si hay weatherAlert = true, NO tocamos estado aquí
-                            // -> lo deja como AVERIADO (o lo que haya puesto WEATHER)
                         }
                     }
+
                     default -> System.out.println("[CENTRAL] Tipo JSON desconocido: " + type);
                 }
             }
         } catch (Exception e) {
             System.out.println("[CENTRAL] Conexión cerrada (" + cliente + "): " + e.getMessage());
-        } finally {
-            // aquí si quieres podrías loguear algo adicional al cierre
         }
     }
 
